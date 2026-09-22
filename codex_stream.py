@@ -71,7 +71,7 @@ def _fold(data, start, size):
     lines = data.split(NEWLINE)
     if start > 0 and lines:
         lines = lines[1:]
-    state = {"maxSeq": -1, "turn": 0, "step": 0,
+    state = {"maxSeq": -1, "maxTime": None, "turn": 0, "step": 0,
              "stepOpen": False, "turnOpen": False, "tornAt": torn_at,
              "stepHasChunks": False}
     for line in lines:
@@ -85,6 +85,12 @@ def _fold(data, start, size):
         seq = event.get("seq")
         if isinstance(seq, int) and seq > state["maxSeq"]:
             state["maxSeq"] = seq
+        # The browser folds the log by time, so both writers clamp their own
+        # stamps to the tail's high-water mark rather than trusting that their
+        # source clock agrees with the other's.
+        when = event.get("time")
+        if isinstance(when, int) and (state["maxTime"] is None or when > state["maxTime"]):
+            state["maxTime"] = when
         kind = event.get("type")
         if kind == "assistant/chunk":
             payload = event.get("data") or {}
@@ -162,10 +168,18 @@ def _locked_append(path, events, fill_placement=False, min_turn=None, only_turn=
                 # that is over. They can never be placed correctly.
                 return {"dropped": True}
         seq = state["maxSeq"]
+        floor = state["maxTime"]
         for event in events:
             if fill_placement:
                 event["data"]["turn"] = state["turn"]
                 event["data"]["step"] = state["step"]
+            # Both writers append to one log the browser folds by time, so a
+            # delta may never carry a stamp below what is already there.
+            when = event.get("time")
+            if isinstance(when, int) and isinstance(floor, int) and when < floor:
+                event["time"] = floor
+            elif isinstance(when, int):
+                floor = when
             seq += 1
             event["seq"] = seq
         fh.seek(0, os.SEEK_END)

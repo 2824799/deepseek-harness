@@ -35,7 +35,17 @@ PERMISSION_FILE = os.path.join(BASE_DIR, "permission-preset.json")
 # session from an older version is rebuilt from its rollout instead of being
 # skipped, because its log is missing whatever the newer rendering adds (for
 # example attached images, or reasoning text that used to be dropped).
-PROJECTION_VERSION = 2
+PROJECTION_VERSION = 3
+
+# Codex item types that each represent one model-visible action, and so each
+# become their own tool row. Projecting only the shell and search calls spliced
+# the actions on either side of a file edit, an MCP call, or a subagent
+# delegation together, which misreported the turn's order and hid the edit.
+TOOL_ITEM_TYPES = (
+    "commandExecution", "webSearch", "fileChange", "mcpToolCall",
+    "dynamicToolCall", "functionCallOutput", "imageView", "sleep",
+    "collabAgentToolCall", "subAgentActivity", "contextCompaction",
+)
 
 # The picker's presets bundle a sandbox mode with an approval policy, and the
 # projector mirrors the chosen bundle back into the log so the picker shows
@@ -212,9 +222,253 @@ def clean_title(name, title):
 
 
 def emit(cx, out, event):
+    # Codex stamps each item with its own creation time while the projector adds
+    # synthetic ones (a turn's first-token and completion instants), and the two
+    # sources occasionally interleave out of order. The browser folds the log by
+    # time, so the log itself is kept non-decreasing.
+    when = event.get("time")
+    if isinstance(when, int):
+        last = cx.get("last_time")
+        if isinstance(last, int) and when < last:
+            event["time"] = last
+        else:
+            cx["last_time"] = when
     cx["seq"] += 1
     event["seq"] = cx["seq"]
     out.append(event)
+
+
+def _text_parts(value):
+    """Flatten one reasoning text field to its plain strings.
+
+    Codex writes reasoning text either as bare strings or as
+    `{"type": "reasoning_text", "text": ...}` parts, and uses both shapes; a
+    reader that understood only one of them dropped every block using the other.
+    """
+    if isinstance(value, list):
+        pieces = []
+        for part in value:
+            if isinstance(part, dict):
+                text = part.get("text")
+                if isinstance(text, str):
+                    pieces.append(text)
+            elif isinstance(part, str):
+                pieces.append(part)
+        return pieces
+    return [value] if isinstance(value, str) else []
+
+
+def reasoning_text(data):
+    """The readable thinking text of one Codex reasoning item.
+
+    A model whose chain of thought is encrypted (the GPT family) publishes it
+    only as an encrypted blob, leaves `content` null, and writes the
+    human-readable condensation to `summary` — so the summary is the only text
+    there is. A model that exposes its chain (deepseek, luna, mimo) does the
+    opposite: full text in `content`, empty `summary`. Reading only one field
+    therefore blanks the panel for one family or the other, so both are read and
+    the full chain wins whenever it is present.
+    """
+    content = NEWLINE.join(p for p in _text_parts(data.get("content")) if p).strip()
+    if content:
+        return content
+    return NEWLINE.join(p for p in _text_parts(data.get("summary")) if p).strip()
+
+
+def _diff_text_pair(diff_text):
+    """Reconstruct a change's before/after text from its unified diff.
+
+    The diff card re-derives its own patch from old and new text, so a file
+    change is projected as that pair: the browser then draws real added/removed
+    rows instead of a pre-rendered blob it cannot style.
+    """
+    old_lines = []
+    new_lines = []
+    for line in diff_text.split(NEWLINE):
+        if line.startswith("@@") or line.startswith("\\"):
+            continue
+        if line.startswith("-"):
+            old_lines.append(line[1:])
+        elif line.startswith("+"):
+            new_lines.append(line[1:])
+        elif line.startswith(" "):
+            old_lines.append(line[1:])
+            new_lines.append(line[1:])
+        elif line == "":
+            # A hunk's blank context line arrives with its leading space eaten.
+            old_lines.append("")
+            new_lines.append("")
+    return NEWLINE.join(old_lines), NEWLINE.join(new_lines)
+
+
+def _file_change_row(data):
+    """One file edit as a diff-card payload plus the row's own path and text."""
+    diffs = []
+    paths = []
+    added_kinds = 0
+    for change in data.get("changes") or []:
+        if not isinstance(change, dict):
+            continue
+        path = change.get("path")
+        if not isinstance(path, str) or not path:
+            continue
+        kind = change.get("kind") if isinstance(change.get("kind"), dict) else {}
+        change_kind = kind.get("type") or "update"
+        diff = change.get("diff")
+        old_text, new_text = _diff_text_pair(diff) if isinstance(diff, str) else (None, "")
+        if change_kind == "add":
+            old_text = None
+            added_kinds += 1
+        elif change_kind == "delete":
+            new_text = ""
+        move = kind.get("move_path")
+        # A moved file is opened where it now lives; the source path would
+        # point at a file that no longer exists.
+        target = move if isinstance(move, str) and move else path
+        label = path + (" -> " + move if isinstance(move, str) and move else "")
+        paths.append(label)
+        diffs.append({"path": target, "oldText": old_text, "newText": new_text})
+    if not diffs:
+        return None
+    # A change that only adds files reads as a write; anything else reads as an
+    # edit. The tool name is what selects the row's icon, title, and openable
+    # path, while the card itself is drawn from the hunks above.
+    all_adds = added_kinds == len(diffs)
+    first = diffs[0]
+    if all_adds:
+        name = "write"
+        args = {"file_path": first["path"], "content": first["newText"]}
+    else:
+        name = "edit"
+        args = {"file_path": first["path"],
+                "old_string": first["oldText"] or "",
+                "new_string": first["newText"]}
+    summary = (paths[0] if len(paths) == 1
+               else "%d files: %s" % (len(paths), ", ".join(paths)))
+    return {"name": name, "args": args, "output": NEWLINE.join(paths),
+            "meta": {"diffs": diffs}, "summary": summary,
+            "isError": data.get("status") == "failed"}
+
+
+def _json_text(value):
+    """A readable rendering of an item's structured arguments or result."""
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return ""
+    try:
+        return json.dumps(value, ensure_ascii=False, indent=2)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _result_text(result):
+    """Flatten an MCP result envelope to the text its blocks carry."""
+    if isinstance(result, str):
+        return result
+    if isinstance(result, dict):
+        blocks = result.get("content")
+        if isinstance(blocks, list):
+            pieces = []
+            for block in blocks:
+                if isinstance(block, dict):
+                    text = block.get("text")
+                    if isinstance(text, str):
+                        pieces.append(text)
+                    elif block.get("type") not in (None, "text"):
+                        pieces.append(_json_text(block))
+            if pieces:
+                return NEWLINE.join(pieces)
+    return _json_text(result)
+
+
+def tool_row(item_type, data):
+    """Map one Codex action item onto the tool row the web UI draws.
+
+    Every item type Codex records for a model-visible action gets a row. Types
+    without a dedicated DSH view fall back to the generic row, which shows the
+    call's arguments and its result text — a faithful rendering beats the
+    alternative of dropping the action and splicing its neighbours together.
+    """
+    if item_type == "commandExecution":
+        command = data.get("command") or ""
+        return {"name": "bash", "args": {"command": command},
+                "output": data.get("aggregatedOutput") or "", "meta": None,
+                "summary": command, "isError": (data.get("exitCode") or 0) != 0}
+    if item_type == "webSearch":
+        query = data.get("query") or ""
+        return {"name": "web_search", "args": {"queries": [query]},
+                "output": "搜索内容: " + str(query), "meta": None,
+                "summary": query, "isError": False}
+    if item_type == "fileChange":
+        return _file_change_row(data)
+    if item_type == "mcpToolCall":
+        server = data.get("server") or ""
+        tool = data.get("tool") or ""
+        arguments = data.get("arguments")
+        # The plugin-owned tools have no DSH view, so the row names them the way
+        # MCP names them everywhere else and shows the arguments verbatim.
+        output = data.get("error") or _result_text(data.get("result"))
+        return {"name": "mcp__%s__%s" % (server, tool),
+                "args": arguments if isinstance(arguments, dict) else {"arguments": arguments},
+                "output": output, "meta": None, "summary": tool or server,
+                "isError": data.get("status") not in (None, "completed")}
+    if item_type == "dynamicToolCall":
+        tool = data.get("tool") or "tool"
+        pieces = []
+        for block in data.get("contentItems") or []:
+            if isinstance(block, dict):
+                text = block.get("text")
+                if isinstance(text, str):
+                    pieces.append(text)
+        return {"name": "%s__%s" % (data.get("namespace") or "tool", tool),
+                "args": data.get("arguments") if isinstance(data.get("arguments"), dict) else {},
+                "output": NEWLINE.join(pieces), "meta": None, "summary": tool,
+                "isError": data.get("success") is False}
+    if item_type == "functionCallOutput":
+        tool = data.get("name") or "tool"
+        return {"name": "%s__%s" % (data.get("namespace") or "tool", tool),
+                "args": {}, "output": data.get("output") or "", "meta": None,
+                "summary": tool, "isError": False}
+    if item_type == "imageView":
+        path = data.get("path") or ""
+        # The durable reference carries no attachment-store identity, so the row
+        # is an ordinary file read whose path link opens the picture, rather
+        # than a read_image row claiming an image card nothing could resolve.
+        return {"name": "read", "args": {"path": path},
+                "output": path, "meta": None, "summary": path, "isError": False}
+    if item_type == "sleep":
+        duration = data.get("durationMs")
+        return {"name": "sleep", "args": {"durationMs": duration},
+                "output": "等待 %s 毫秒" % duration, "meta": None,
+                "summary": str(duration), "isError": False}
+    if item_type == "collabAgentToolCall":
+        prompt = data.get("prompt") or ""
+        receivers = data.get("receiverThreadIds") or []
+        # `subagent` is the name the chat's process fold recognizes as a
+        # delegation, so the turn's process disclosure counts it as one.
+        return {"name": "subagent",
+                "args": {"prompt": prompt, "model": data.get("model"),
+                         "tool": data.get("tool")},
+                "output": "子代理: " + ", ".join(str(r) for r in receivers),
+                "meta": None, "summary": prompt,
+                "isError": data.get("status") not in (None, "completed")}
+    if item_type == "subAgentActivity":
+        path = data.get("agentPath") or ""
+        return {"name": "subagent",
+                "args": {"agentThreadId": data.get("agentThreadId")},
+                "output": "%s %s" % (data.get("kind") or "", path),
+                "meta": None, "summary": "%s %s" % (data.get("kind") or "", path),
+                "isError": False}
+    if item_type == "contextCompaction":
+        # Compaction is a marker in Codex's log, not a tool call. Emitting DSH's
+        # own compaction lifecycle would demand a matching summary event and
+        # surface replacement, and a malformed one makes the browser reject the
+        # whole log; a plain marker row keeps the position visible and safe.
+        return {"name": "context_compaction", "args": {},
+                "output": "上下文已压缩", "meta": None,
+                "summary": "上下文已压缩", "isError": False}
+    return None
 
 
 def _scan_log(path):
@@ -225,6 +479,14 @@ def _scan_log(path):
     """
     with open(path, "r", encoding="utf-8", errors="replace") as fh:
         return codex_stream._scan(fh)
+
+
+def read_log_tail(path):
+    """The log's structural tail, or None when it cannot be read."""
+    try:
+        return _scan_log(path)
+    except OSError:
+        return None
 
 
 def append_locked(path, events):
@@ -422,7 +684,7 @@ def run():
                 cx = {
                     "seq": -1, "turn": 0, "step": 0, "step_open": False,
                     "turn_open": False, "pending": [], "step_start": None,
-                    "last_ordinal": -1, "label": None,
+                    "last_ordinal": -1, "label": None, "last_time": None,
                     "perm": permission_presets.get(th_id, "danger-full-access"),
                     "version": PROJECTION_VERSION,
                 }
@@ -449,6 +711,12 @@ def run():
                 cx = dict(st)
                 cx["version"] = PROJECTION_VERSION
                 cx["pending"] = list(cx.get("pending") or [])
+                # Continue the log's own high-water time mark rather than this
+                # process's, so a resumed pass cannot emit a stamp below the
+                # tail the streamer already wrote.
+                tail = read_log_tail(jsonl_file)
+                if tail is not None and tail.get("maxTime") is not None:
+                    cx["last_time"] = tail["maxTime"]
                 out = []
                 if cx.get("label") != label:
                     emit(cx, out, {"type": "session/title", "time": int(time.time() * 1000),
@@ -564,81 +832,54 @@ def run():
                                    "surfaceOp": "append"})
 
                 elif item_type == "reasoning":
-                    r_text = ""
-                    summary = data.get("summary")
-                    if isinstance(summary, list):
-                        r_text = NEWLINE.join(str(s) for s in summary if s)
-                    elif isinstance(summary, str):
-                        r_text = summary
-                    if not r_text:
-                        content = data.get("content")
-                        if isinstance(content, list):
-                            # Reasoning text arrives either as plain strings or
-                            # as {"type": "reasoning_text", "text": ...} parts,
-                            # and Codex uses both shapes; reading only the dict
-                            # form silently dropped every thinking block.
-                            pieces = []
-                            for part in content:
-                                if isinstance(part, dict):
-                                    pieces.append(part.get("text", ""))
-                                elif isinstance(part, str):
-                                    pieces.append(part)
-                            r_text = NEWLINE.join(p for p in pieces if p)
-                        elif isinstance(content, str):
-                            r_text = content
-                    if r_text.strip():
-                        cx["pending"].append(r_text.strip())
+                    r_text = reasoning_text(data)
+                    if r_text:
+                        cx["pending"].append(r_text)
 
-                elif item_type in ("commandExecution", "webSearch"):
-                    if not cx["step_open"]:
-                        open_step(created_ms)
+                elif item_type in TOOL_ITEM_TYPES:
+                    row = tool_row(item_type, data)
+                    if row is not None:
+                        if not cx["step_open"]:
+                            open_step(created_ms)
 
-                    call_id = "call-" + str(uuid.uuid4())
-                    if item_type == "commandExecution":
-                        tool_name = "bash"
-                        cmd = data.get("command", "")
-                        out_text = data.get("aggregatedOutput") or ""
-                        code = data.get("exitCode", 0)
-                        args_raw = json.dumps({"command": cmd}, ensure_ascii=False)
-                        is_err = code != 0
-                    else:
-                        tool_name = "web_search"
-                        query = data.get("query", "")
-                        args_raw = json.dumps({"queries": [query]}, ensure_ascii=False)
-                        is_err = False
-                        out_text = "搜索内容: " + str(query)
+                        call_id = "call-" + str(uuid.uuid4())
+                        tool_name = row["name"]
+                        args_raw = json.dumps(row["args"], ensure_ascii=False)
+                        out_text = row["output"]
+                        is_err = row["isError"]
 
-                    blocks = []
-                    if cx["pending"]:
-                        blocks.append({"type": "reasoning", "text": NEWLINE.join(cx["pending"]).strip()})
-                        cx["pending"] = []
-                    blocks.append({"type": "tool-call", "id": call_id,
-                                   "name": tool_name, "arguments": args_raw})
+                        blocks = []
+                        if cx["pending"]:
+                            blocks.append({"type": "reasoning", "text": NEWLINE.join(cx["pending"]).strip()})
+                            cx["pending"] = []
+                        blocks.append({"type": "tool-call", "id": call_id,
+                                       "name": tool_name, "arguments": args_raw})
 
-                    emit(cx, out, {
-                        "type": "assistant/message", "time": created_ms,
-                        "data": {"turn": cx["turn"], "step": cx["step"], "stream": [],
-                                 **({} if step_usage is None else {"usage": step_usage}),
-                                 "message": {"id": str(uuid.uuid4()), "role": "assistant",
-                                             "content": blocks, "source": dict(MODEL_SOURCE)}},
-                        "surfaceOp": "append",
-                    })
-                    emit(cx, out, {"type": "tool/call", "time": created_ms,
-                                   "data": {"turn": cx["turn"], "step": cx["step"],
-                                            "callId": call_id, "name": tool_name,
-                                            "arguments": args_raw}})
-                    emit(cx, out, {
-                        "type": "tool/result", "time": created_ms,
-                        "data": {"turn": cx["turn"], "step": cx["step"],
-                                 "message": {"source": {"kind": "tool", "callId": call_id},
-                                             "content": [{"type": "tool-result",
-                                                          "toolCallId": call_id,
-                                                          "content": [{"type": "text", "text": out_text}],
-                                                          "isError": is_err}],
-                                             "role": "user", "id": str(uuid.uuid4())}},
-                        "surfaceOp": "append",
-                    })
-                    close_step(created_ms)
+                        emit(cx, out, {
+                            "type": "assistant/message", "time": created_ms,
+                            "data": {"turn": cx["turn"], "step": cx["step"], "stream": [],
+                                     **({} if step_usage is None else {"usage": step_usage}),
+                                     "message": {"id": str(uuid.uuid4()), "role": "assistant",
+                                                 "content": blocks, "source": dict(MODEL_SOURCE)}},
+                            "surfaceOp": "append",
+                        })
+                        emit(cx, out, {"type": "tool/call", "time": created_ms,
+                                       "data": {"turn": cx["turn"], "step": cx["step"],
+                                                "callId": call_id, "name": tool_name,
+                                                "arguments": args_raw}})
+                        emit(cx, out, {
+                            "type": "tool/result", "time": created_ms,
+                            "data": {"turn": cx["turn"], "step": cx["step"],
+                                     **({} if row["meta"] is None else {"meta": row["meta"]}),
+                                     "message": {"source": {"kind": "tool", "callId": call_id},
+                                                 "content": [{"type": "tool-result",
+                                                              "toolCallId": call_id,
+                                                              "content": [{"type": "text", "text": out_text}],
+                                                              "isError": is_err}],
+                                                 "role": "user", "id": str(uuid.uuid4())}},
+                            "surfaceOp": "append",
+                        })
+                        close_step(created_ms)
 
                 elif item_type == "agentMessage":
                     text = data.get("text", "")
