@@ -1,73 +1,116 @@
-import fs from 'fs';
+/**
+ * Idempotent patcher for the installed DSH host ApiProxy.
+ *
+ * The Codex web edition needs three things the stock package does not do:
+ *   1. route session.prompt / rename / archive / create to Codex instead of
+ *      the DSH-local agent,
+ *   2. stream projected Codex events into the browser mux stream, and
+ *   3. keep those hooks present after a package upgrade.
+ *
+ * Run with: node patch_apiproxy.js
+ */
+import fs from "node:fs";
 
-const file = '/home/nahida/.local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-host-apiproxy/lib/index.js';
-let code = fs.readFileSync(file, 'utf-8');
+const PKG = '/home/nahida/.local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-host-apiproxy/lib/index.js';
+const BRIDGE = '/home/nahida/agents/sever/dsh/bridge_hook.js';
+const TAILER = '/home/nahida/agents/sever/dsh/codex_tailer.js';
+const GUARD = 'process.env.DSH_HOME && process.env.DSH_HOME.includes(".dsh-codex")';
 
-// 1. Add import at top
-const importStatement = 'import { handleCodexPrompt, handleCodexArchive, handleCodexRename } from "/home/nahida/agents/sever/dsh/bridge_hook.js";\n';
-if (!code.includes('handleCodexPrompt')) {
-  code = importStatement + code;
+let code = fs.readFileSync(PKG, 'utf-8');
+let changed = false;
+
+function ensure(needle, apply) {
+  if (code.includes(needle)) return;
+  const next = apply();
+  if (next === code) {
+    console.error('  MISS: could not apply hook for', JSON.stringify(needle).slice(0, 60));
+    process.exitCode = 1;
+    return;
+  }
+  code = next;
+  changed = true;
+  console.log('  applied:', JSON.stringify(needle).slice(0, 60));
 }
 
-// 2. Patch prompt
-const targetPrompt = 'async prompt(request) {\n\t\t\t\tconst { sessionId, mode, content, clientTimeZone } = request.payload;';
-const replacementPrompt = `async prompt(request) {
+// --- 1. imports ---------------------------------------------------------
+const OLD_IMPORT = /^import \{ handleCodexPrompt[^\n]*\n(?:import \{ startCodexTailer \}[^\n]*\n)?/;
+const NEW_IMPORT = `import { handleCodexPrompt, handleCodexArchive, handleCodexRename, handleCodexCreate, handleCodexFork, handleCodexCancel } from "${BRIDGE}";\n` +
+                   `import { startCodexTailer } from "${TAILER}";\n`;
+if (!code.includes('startCodexTailer')) {
+  if (OLD_IMPORT.test(code)) code = code.replace(OLD_IMPORT, NEW_IMPORT);
+  else code = NEW_IMPORT + code;
+  changed = true;
+  console.log('  applied: bridge imports');
+}
+
+// --- 2. session.prompt -> Codex ----------------------------------------
+ensure('handleCodexPrompt(sessionId, mode, content)', () => code.replace(
+  'async prompt(request) {\n\t\t\t\tconst { sessionId, mode, content, clientTimeZone } = request.payload;',
+  `async prompt(request) {
 \t\t\t\tconst { sessionId, mode, content, clientTimeZone } = request.payload;
-\t\t\t\tif (process.env.DSH_HOME && process.env.DSH_HOME.includes(".dsh-codex")) {
+\t\t\t\tif (${GUARD}) {
 \t\t\t\t\tconst bridgeRes = await handleCodexPrompt(sessionId, mode, content);
-\t\t\t\t\tif (!bridgeRes.ok) {
-\t\t\t\t\t\treturn err(request, {
-\t\t\t\t\t\t\tcode: "internal",
-\t\t\t\t\t\t\tmessage: "Codex queue failed: " + bridgeRes.error,
-\t\t\t\t\t\t\tdetails: { sessionId }
-\t\t\t\t\t\t});
-\t\t\t\t\t}
+\t\t\t\t\tif (!bridgeRes.ok) return err(request, {
+\t\t\t\t\t\tcode: "internal",
+\t\t\t\t\t\tmessage: "Codex send failed: " + bridgeRes.error,
+\t\t\t\t\t\tdetails: { sessionId }
+\t\t\t\t\t});
 \t\t\t\t\treturn ok(request, { accepted: true });
-\t\t\t\t}`;
+\t\t\t\t}`));
 
-if (!code.includes('handleCodexPrompt(sessionId, mode, content)')) {
-  if (code.includes(targetPrompt)) {
-    code = code.replace(targetPrompt, replacementPrompt);
-    console.log('Patched prompt successfully');
-  } else {
-    console.error('Target prompt not found');
-    process.exit(1);
-  }
-}
-
-// 3. Patch archive
-const targetArchive = 'await ctx.workspaceRegistry.archiveSession(sessionId);';
-const replacementArchive = `if (process.env.DSH_HOME && process.env.DSH_HOME.includes(".dsh-codex")) {
+// --- 3. archive -> Codex ----------------------------------------------
+ensure('handleCodexArchive(sessionId)', () => code.replace(
+  'await ctx.workspaceRegistry.archiveSession(sessionId);',
+  `if (${GUARD}) {
 \t\t\t\t\thandleCodexArchive(sessionId);
-\t\t\t\t}
-\t\t\t\tawait ctx.workspaceRegistry.archiveSession(sessionId);`;
+\t\t\t\t}\n\t\t\t\tawait ctx.workspaceRegistry.archiveSession(sessionId);`));
 
-if (!code.includes('handleCodexArchive(sessionId)')) {
-  if (code.includes(targetArchive)) {
-    code = code.replace(targetArchive, replacementArchive);
-    console.log('Patched archive successfully');
-  } else {
-    console.error('Target archive not found');
-    process.exit(1);
-  }
-}
-
-// 4. Patch rename
-const targetRename = 'const accepted = titles.rename(found.agent.session, title);';
-const replacementRename = `if (process.env.DSH_HOME && process.env.DSH_HOME.includes(".dsh-codex")) {
+// --- 4. rename -> Codex -----------------------------------------------
+ensure('handleCodexRename(sessionId, title)', () => code.replace(
+  'const accepted = titles.rename(found.agent.session, title);',
+  `if (${GUARD}) {
 \t\t\t\t\thandleCodexRename(sessionId, title);
+\t\t\t\t}\n\t\t\t\tconst accepted = titles.rename(found.agent.session, title);`));
+
+// --- 5. session.create -> real Codex thread ---------------------------
+ensure('handleCodexCreate(', () => code.replace(
+  'async create(request) {\n\t\t\t\tconst sessionId = request.payload.sessionId ?? `session-${randomUUID()}`;',
+  `async create(request) {
+\t\t\t\tif (${GUARD}) {
+\t\t\t\t\tconst created = handleCodexCreate(request.payload.cwd);
+\t\t\t\t\tif (created && created.ok && created.sessionId) {
+\t\t\t\t\t\treturn ok(request, { sessionId: "session-" + created.threadId, agentPreset: "standard" });
+\t\t\t\t\t}
+\t\t\t\t\treturn err(request, { code: "internal", message: "Codex thread/start failed: " + (created && created.error), details: {} });
 \t\t\t\t}
-\t\t\t\tconst accepted = titles.rename(found.agent.session, title);`;
+\t\t\t\tconst sessionId = request.payload.sessionId ?? \`session-\${randomUUID()}\`;`));
 
-if (!code.includes('handleCodexRename(sessionId, title)')) {
-  if (code.includes(targetRename)) {
-    code = code.replace(targetRename, replacementRename);
-    console.log('Patched rename successfully');
-  } else {
-    console.error('Target rename not found');
-    process.exit(1);
+// --- 6. live tail of projected Codex events into the mux stream -------
+// Started once per host process and fanned out through the same broadcast()
+// channel DSH uses for its own session events.
+ensure('startCodexTailer(', () => {
+  const anchor = '\t/** Send one transient frame to every connected mux consumer. */\n\tfunction broadcast(payload) {\n\t\tconst envelope = frame(payload);\n\t\tfor (const queue of muxQueues) queue.push(envelope);\n\t}';
+  if (!code.includes(anchor)) {
+    console.error('  MISS: broadcast() anchor not found');
+    return code;
   }
-}
+  return code.replace(anchor, anchor +
+    `\n\tif (${GUARD}) startCodexTailer((payload) => broadcast(payload));`);
+});
 
-fs.writeFileSync(file, code, 'utf-8');
-console.log('Saved index.js');
+// --- 7. stop button -> Codex turn/interrupt ----------------------------
+ensure('handleCodexCancel(sessionId)', () => code.replace(
+  'cancel(request) {\n\t\t\t\tconst { sessionId } = request.payload;',
+  `cancel(request) {
+\t\t\t\tconst { sessionId } = request.payload;
+\t\t\t\tif (${GUARD}) {
+\t\t\t\t\thandleCodexCancel(sessionId);
+\t\t\t\t\treturn Promise.resolve(ok(request, { accepted: true }));
+\t\t\t\t}`));
+
+if (changed) {
+  fs.writeFileSync(PKG, code, 'utf-8');
+  console.log('saved', PKG);
+} else {
+  console.log('already patched; nothing to do');
+}

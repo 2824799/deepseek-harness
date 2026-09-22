@@ -56,3 +56,36 @@ export function handleCodexRename(sessionId, title) {
   ]);
 }
 
+export function handleCodexCreate(workspacePath) {
+  const res = cp.spawnSync("python3", [
+    "/home/nahida/agents/sever/dsh/codex_bridge.py",
+    "create",
+    workspacePath || "None"
+  ], { encoding: "utf-8" });
+  try {
+    return JSON.parse((res.stdout || "").trim());
+  } catch (e) {
+    return { ok: false, error: res.stderr || res.stdout || String(e) };
+  }
+}
+
+export function handleCodexFork(sessionId) {
+  const res = cp.spawnSync("python3", [
+    "/home/nahida/agents/sever/dsh/codex_bridge.py",
+    "fork",
+    sessionId
+  ], { encoding: "utf-8" });
+  try {
+    return JSON.parse((res.stdout || "").trim());
+  } catch (e) {
+    return { ok: false, error: res.stderr || res.stdout || String(e) };
+  }
+}
+
+export function handleCodexCancel(sessionId) {
+  cp.spawnSync("python3", [
+    "/home/nahida/agents/sever/dsh/codex_bridge.py",
+    "cancel",
+    sessionId
+  ]);
+}

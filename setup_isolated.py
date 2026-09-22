@@ -77,7 +77,6 @@ def run():
         for th in ginfo["threads"]:
             th_id, title, name, created_at, updated_at, _, _ = th
             sess_dir_name = f"session-{th_id}"
-            sess_ids.append(sess_dir_name)
 
             sess_path = os.path.join(ws_dir, sess_dir_name)
             os.makedirs(sess_path, exist_ok=True)
@@ -90,8 +89,16 @@ def run():
                 ORDER BY rollout_ordinal ASC
             """, (th_id,))
             items = hist_cur.fetchall()
+            # A thread with no recorded items cannot be projected: listing it
+            # would make the browser request a log that does not exist and show
+            # "history unavailable".
             if not items:
+                try:
+                    os.rmdir(sess_path)
+                except OSError:
+                    pass
                 continue
+            sess_ids.append(sess_dir_name)
 
             # 优先使用 name（用户或系统赋予的精准会话名）
             clean_title = (name or title or "新对话").strip()
@@ -401,4 +408,3 @@ def run():
 
 if __name__ == '__main__':
     run()
-
