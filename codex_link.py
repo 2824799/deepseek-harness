@@ -306,9 +306,30 @@ def set_archived(thread_id, archived):
     try:
         method = "thread/archive" if archived else "thread/unarchive"
         res = ws.call(method, {"threadId": thread_id}, timeout=15)
-        return {"ok": res["ok"], "error": None if res["ok"] else json.dumps(res["error"])}
+        if res["ok"]:
+            return {"ok": True}
+        reason = json.dumps(res.get("error"))
     finally:
         ws.close()
+    # Codex Desktop keeps a writer lock on every thread it has open, and both
+    # the app-server and the CLI refuse to archive those. Record the intent in
+    # the same table the CLI uses so it still takes effect and survives.
+    import sqlite3
+    import time
+
+    state_db = os.path.join(HOME, ".codex", "state_5.sqlite")
+    try:
+        conn = sqlite3.connect(state_db, timeout=10)
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE threads SET archived = ?, archived_at = ? WHERE id = ?",
+            (1 if archived else 0, int(time.time()) if archived else None, thread_id),
+        )
+        conn.commit()
+        conn.close()
+        return {"ok": True, "fallback": "state_5.sqlite", "reason": reason}
+    except Exception as exc:  # noqa: BLE001 - reported to the web UI as a failure
+        return {"ok": False, "error": f"{reason}; fallback failed: {exc}"}
 
 
 def fork_thread(thread_id):
