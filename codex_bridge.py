@@ -41,6 +41,16 @@ def refresh_sessions():
 
 def send_prompt(session_id, payload):
     thread_id = extract_thread_id(session_id)
+    # The permission picker is a slash command in this UI, so it arrives on the
+    # prompt channel. It is a Codex setting rather than something to say to the
+    # model, and answering it here is what stops the command text from being
+    # sent to Codex as a message.
+    text = (payload.get("text") or "").strip()
+    if text.startswith("/permission"):
+        parts = text.split()
+        if len(parts) < 2:
+            return {"ok": False, "error": "usage: /permission <preset>"}
+        return set_permission(session_id, parts[1])
     result = codex_link.send_prompt(thread_id, payload)
     if result.get("ok"):
         refresh_sessions()
@@ -83,6 +93,32 @@ def cancel_session(session_id):
     return codex_link.interrupt_turn(thread_id)
 
 
+def set_model(session_id, model, effort=None):
+    """Record the web UI's model choice for this thread.
+
+    Codex has no standalone "set this thread's model" call, so the choice is
+    stored and attached to every later turn/start.
+    """
+    thread_id = extract_thread_id(session_id)
+    return {"ok": True, **codex_link.save_selection(thread_id, model, effort or None)}
+
+
+def set_permission(session_id, preset):
+    """Record the web UI's permission preset for this thread.
+
+    Codex takes the sandbox and approval pair per turn, so the preset is stored
+    and merged into every later turn/start alongside the model choice.
+    """
+    thread_id = extract_thread_id(session_id)
+    return codex_link.save_permission(thread_id, preset)
+
+
+def model_state(session_id):
+    """The model label for this thread without resuming it through DSH."""
+    thread_id = extract_thread_id(session_id)
+    return {"ok": True, "current": codex_link.current_selection(thread_id)}
+
+
 def main(argv):
     if len(argv) < 2:
         print(json.dumps({"ok": False, "error": "No action specified"}))
@@ -104,6 +140,12 @@ def main(argv):
             result = fork_session(argv[2])
         elif action == "cancel":
             result = cancel_session(argv[2])
+        elif action == "model":
+            result = set_model(argv[2], argv[3], argv[4] if len(argv) > 4 else None)
+        elif action == "permission":
+            result = set_permission(argv[2], argv[3])
+        elif action == "model-state":
+            result = model_state(argv[2])
         elif action == "ping":
             probe = codex_link.WSClient()
             probe.close()

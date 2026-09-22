@@ -4,6 +4,14 @@ apps/desktop/.env.windows
 apps/desktop/.env.macos
 apps/desktop/*.p12
 node_modules/
+__pycache__/
+*.pyc
+# The scratch UI from the first attempt, and one-off migration scripts whose
+# paths are hardcoded to one machine's home. Neither is part of the edition.
+codex-web/
+align_workspaces.py
+sync_codex_to_dsh.py
+sync_isolated_daemon.py
 lib/
 *.tsbuildinfo
 pnpm-debug.log

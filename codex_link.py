@@ -25,9 +25,144 @@ import struct
 import sys
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import codex_stream  # noqa: E402
+
 HOME = os.path.expanduser("~")
 PORT = int(os.environ.get("CODEX_DSH_APPSERVER_PORT", "45880"))
 HOST = "127.0.0.1"
+SELECTION_FILE = "/home/nahida/agents/sever/dsh/.dsh-codex/model-selection.json"
+SETTINGS_FILE = "/home/nahida/agents/sever/dsh/.dsh-codex/settings.yaml"
+PERMISSION_FILE = "/home/nahida/agents/sever/dsh/.dsh-codex/permission-preset.json"
+
+# The web UI's permission presets bundle a sandbox mode with an approval
+# policy. Codex takes the same pair per turn, so the mapping is direct; the
+# ids match on both sides, which keeps the picker's label honest.
+PERMISSION_POLICIES = {
+    "read-only": ({"type": "readOnly"}, "on-request"),
+    "workspace-write": ({"type": "workspaceWrite"}, "on-request"),
+    "danger-full-access": ({"type": "dangerFullAccess"}, "never"),
+}
+
+
+def load_permissions():
+    """Per-thread permission preset chosen in the web UI."""
+    try:
+        with open(PERMISSION_FILE, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_permission(thread_id, preset):
+    """Remember a thread's permission preset so every later turn keeps it.
+
+    turn/start carries sandboxPolicy and approvalPolicy and Codex applies them
+    to that turn and the ones after it, but turn/steer accepts neither, so the
+    choice has to be re-sent with each turn/start for the picker to stay
+    authoritative.
+    """
+    if preset not in PERMISSION_POLICIES:
+        return {"ok": False, "error": f"unknown permission preset {preset!r}"}
+    permissions = load_permissions()
+    permissions[thread_id] = preset
+    try:
+        os.makedirs(os.path.dirname(PERMISSION_FILE), exist_ok=True)
+        tmp = PERMISSION_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(permissions, handle, ensure_ascii=False, indent=2)
+        os.replace(tmp, PERMISSION_FILE)
+    except OSError as exc:
+        return {"ok": False, "error": f"could not record the preset: {exc}"}
+    return {"ok": True, "preset": preset}
+
+
+def permission_override(thread_id):
+    """The turn/start fields for this thread's preset, or nothing when unset."""
+    preset = load_permissions().get(thread_id)
+    policy = PERMISSION_POLICIES.get(preset)
+    if policy is None:
+        return {}
+    sandbox, approval = policy
+    return {"sandboxPolicy": sandbox, "approvalPolicy": approval}
+
+
+def default_model():
+    """The model the web UI shows for a new conversation.
+
+    DSH reads this from its own settings, so a conversation created from the web
+    must start on the same model or the label in the composer would describe a
+    model Codex is not actually using.
+    """
+    try:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+    except OSError:
+        return None
+    in_block = False
+    for line in lines:
+        if line.startswith("agent-default-model:"):
+            in_block = True
+            continue
+        if in_block:
+            if line and not line[0].isspace():
+                break
+            stripped = line.strip()
+            if stripped.startswith("model:"):
+                return stripped.split(":", 1)[1].strip().strip("'\"") or None
+    return None
+
+
+def load_selections():
+    """Per-thread model choices made in the web UI."""
+    try:
+        with open(SELECTION_FILE, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_selection(thread_id, model, effort=None):
+    """Remember a thread's model choice so later turns keep using it.
+
+    Codex applies a model override to the turn it is sent with and to
+    subsequent turns, but it has no standalone "set this thread's model"
+    call, and turn/steer accepts no model at all. Persisting the choice and
+    sending it on each turn/start is what makes the web picker authoritative.
+    """
+    selections = load_selections()
+    entry = {"model": model}
+    if effort:
+        entry["effort"] = effort
+    selections[thread_id] = entry
+    try:
+        os.makedirs(os.path.dirname(SELECTION_FILE), exist_ok=True)
+        tmp = SELECTION_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(selections, handle, ensure_ascii=False, indent=2)
+        os.replace(tmp, SELECTION_FILE)
+    except OSError:
+        pass
+    return entry
+
+
+def current_selection(thread_id):
+    """The model this thread will use, without asking DSH to resume it.
+
+    DSH answers session.models by resuming the session's agent, and in this
+    edition the session store IS the projected log, so that read would append a
+    second writer's events to it. The web UI only needs the label, which the
+    recorded choice already carries.
+    """
+    selection = load_selections().get(thread_id) or {}
+    return {
+        "provider": "opencodex",
+        "model": selection.get("model") or default_model(),
+        **({} if not selection.get("effort") else {"reasoningEffort": selection["effort"]}),
+    }
 
 
 class WSError(Exception):
@@ -159,12 +294,26 @@ def connect(timeout=10.0):
 
 def thread_is_running(ws, thread_id):
     """Return the active turn id when the thread is mid-turn, else None."""
-    res = ws.call("thread/read", {"threadId": thread_id, "includeTurns": False}, timeout=15)
+    # thread/read only fills its turns list for the resume/fork/read-with-turns
+    # shapes, so the old includeTurns=False call always saw an empty list and
+    # this check could never report a running turn. Hydrating turns from
+    # thread/read is also deprecated and costs megabytes on a long thread, so
+    # only the newest page of turn summaries is fetched.
+    res = ws.call("thread/turns/list",
+                  {"threadId": thread_id, "limit": 3, "itemsView": "notLoaded"},
+                  timeout=15)
     if not res["ok"]:
-        return None, res
-    thread = (res["value"] or {}).get("thread") or {}
-    turns = thread.get("turns") or []
-    for turn in reversed(turns):
+        # An older app-server may not serve the paginated call; fall back to a
+        # metadata read, which still reports the thread's own status.
+        res = ws.call("thread/read", {"threadId": thread_id, "includeTurns": False},
+                      timeout=15)
+        if not res["ok"]:
+            return None, res
+        thread = (res["value"] or {}).get("thread") or {}
+        return (thread.get("id") if thread.get("status") == "running" else None), res
+    # The page is newest-first, and only the newest turn can still be running.
+    turns = (res["value"] or {}).get("data") or []
+    for turn in turns:
         if turn.get("status") == "inProgress":
             return turn.get("id"), res
     return None, res
@@ -216,6 +365,26 @@ def send_prompt(thread_id, payload):
     items = payload_to_content(payload)
     if not items:
         return {"ok": False, "error": "empty prompt"}
+    selection = load_selections().get(thread_id) or {}
+    model_override = {}
+    if payload.get("model"):
+        model_override["model"] = payload["model"]
+    elif selection.get("model"):
+        model_override["model"] = selection["model"]
+    effort = payload.get("effort") or selection.get("effort")
+    if effort:
+        model_override["effort"] = effort
+    # Codex only returns the model's reasoning text when a summary is asked
+    # for; with the default ("none") the reasoning item arrives empty and the
+    # web conversation shows no thinking. "detailed" is what surfaces it.
+    summary = payload.get("summary")
+    if summary is None:
+        summary = selection.get("summary") or "detailed"
+    if summary:
+        model_override["summary"] = summary
+    # The permission picker writes to its own file, so it is merged in beside
+    # the model choice rather than replacing it: a turn carries both.
+    model_override.update(permission_override(thread_id))
     ws = connect()
     try:
         # Attach to the thread first: turn/start needs a loaded thread, and a
@@ -227,29 +396,64 @@ def send_prompt(thread_id, payload):
                 # Codex Desktop holds the writer lock for this thread; the only
                 # supported channel is the durable queue, which Desktop drains.
                 return queue_prompt(thread_id, items, reason)
-            return {"ok": False, "error": reason}
+            if "no rollout found" not in reason:
+                return {"ok": False, "error": reason}
+            # A thread created moments ago has no rollout file yet, so resume
+            # has nothing to attach to. turn/start loads it itself, which is
+            # exactly what the first message of a new conversation needs.
 
         active_turn, _ = thread_is_running(ws, thread_id)
         if active_turn:
+            # turn/steer takes no model, so a mid-turn message cannot switch it;
+            # the choice is already recorded and applies from the next turn.
             res = ws.call(
                 "turn/steer",
                 {"threadId": thread_id, "expectedTurnId": active_turn, "input": items},
                 timeout=20,
             )
             if res["ok"]:
-                return {"ok": True, "mode": "steer", "turnId": active_turn}
+                # A steer continues the turn that is already open, so the
+                # streamer may fill into it immediately.
+                stream = hand_off_stream(ws, thread_id, steer=True, turn_id=active_turn)
+                return {"ok": True, "mode": "steer", "turnId": active_turn,
+                        "stream": stream}
             if "active writer" in json.dumps(res.get("error")):
                 return queue_prompt(thread_id, items, json.dumps(res.get("error")))
             return {"ok": False, "error": json.dumps(res["error"])}
-        res = ws.call("turn/start", {"threadId": thread_id, "input": items}, timeout=25)
+        params = {"threadId": thread_id, "input": items}
+        params.update(model_override)
+        res = ws.call("turn/start", params, timeout=25)
         if res["ok"]:
             turn = (res["value"] or {}).get("turn") or {}
-            return {"ok": True, "mode": "start", "turnId": turn.get("id")}
+            stream = hand_off_stream(ws, thread_id, steer=False,
+                                     turn_id=turn.get("id"))
+            return {"ok": True, "mode": "start", "turnId": turn.get("id"),
+                    "stream": stream}
         if "active writer" in json.dumps(res.get("error")):
             return queue_prompt(thread_id, items, json.dumps(res.get("error")))
         return {"ok": False, "error": json.dumps(res["error"])}
     finally:
         ws.close()
+
+
+def hand_off_stream(ws, thread_id, steer, turn_id=None):
+    """Give this connection's socket to a detached child that follows the turn.
+
+    Codex only emits token deltas on the connection that submitted the turn, so
+    the streaming child inherits this socket instead of opening its own. The
+    parent still closes its copy, which is safe: the child holds a duplicate
+    descriptor and the kernel keeps the connection alive until it is closed.
+    """
+    session_id = "session-" + thread_id
+    tail = codex_stream.read_tail(session_id)
+    current = (tail or {}).get("turn") or 0
+    # A fresh turn has not reached the log yet, so the child waits for the turn
+    # counter to advance. A steer lands inside the turn already open.
+    base_turn = current - 1 if steer else current
+    pid = codex_stream.spawn_streamer(ws, thread_id, session_id, base_turn, turn_id)
+    if pid is None:
+        return {"ok": False, "reason": "fork failed"}
+    return {"ok": True, "pid": pid, "baseTurn": base_turn}
 
 
 def queue_prompt(thread_id, items, reason=None):
@@ -279,15 +483,21 @@ def queue_prompt(thread_id, items, reason=None):
 def create_thread(payload):
     cwd = payload.get("cwd") or "/home/nahida/agents/sever"
     params = {"cwd": cwd}
-    if payload.get("model"):
-        params["model"] = payload["model"]
+    model = payload.get("model") or default_model()
+    if model:
+        params["model"] = model
     ws = connect()
     try:
         res = ws.call("thread/start", params, timeout=25)
         if not res["ok"]:
             return {"ok": False, "error": json.dumps(res["error"])}
         thread = (res["value"] or {}).get("thread") or {}
-        return {"ok": True, "threadId": thread.get("id"), "sessionId": thread.get("sessionId")}
+        thread_id = thread.get("id")
+        if thread_id and model:
+            # New conversations have no prior turn to carry the override, so the
+            # choice is recorded for the first turn/start to pick up.
+            save_selection(thread_id, model)
+        return {"ok": True, "threadId": thread_id, "sessionId": thread.get("sessionId")}
     finally:
         ws.close()
 
@@ -399,6 +609,12 @@ def main(argv):
             print(json.dumps(set_archived(argv[2], False)))
         elif action == "fork":
             print(json.dumps(fork_thread(argv[2])))
+        elif action == "model":
+            effort = argv[4] if len(argv) > 4 and argv[4] else None
+            print(json.dumps({"ok": True,
+                              **save_selection(argv[2], argv[3], effort)}))
+        elif action == "permission":
+            print(json.dumps(save_permission(argv[2], argv[3])))
         else:
             print(json.dumps({"ok": False, "error": f"unknown action {action}"}))
             return 1
