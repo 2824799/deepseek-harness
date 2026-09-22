@@ -16,10 +16,12 @@ import fcntl
 import json
 import os
 import sqlite3
+import shutil
 import time
 import uuid
 
 import codex_stream
+import codex_live
 
 HOME = os.path.expanduser("~")
 CODEX_STATE = os.path.join(HOME, ".codex/state_5.sqlite")
@@ -35,7 +37,7 @@ PERMISSION_FILE = os.path.join(BASE_DIR, "permission-preset.json")
 # session from an older version is rebuilt from its rollout instead of being
 # skipped, because its log is missing whatever the newer rendering adds (for
 # example attached images, or reasoning text that used to be dropped).
-PROJECTION_VERSION = 3
+PROJECTION_VERSION = 4
 
 # Codex item types that each represent one model-visible action, and so each
 # become their own tool row. Projecting only the shell and search calls spliced
@@ -571,6 +573,11 @@ def run():
     # archived conversation keep showing up in the sidebar.
     state_cur.execute("SELECT id FROM threads WHERE archived = 1")
     archived_session_ids = ["session-" + row[0] for row in state_cur.fetchall()]
+    # Every thread id that still exists in Codex, archived or not. Session
+    # directories outside this set belong to threads Codex has deleted and
+    # must not keep listing on the web.
+    state_cur.execute("SELECT id FROM threads")
+    known_session_ids = {"session-" + row[0] for row in state_cur.fetchall()}
     state_conn.close()
 
     hist_conn = sqlite3.connect(CODEX_HISTORY)
@@ -582,27 +589,60 @@ def run():
     hist_cur.execute("SELECT thread_id, MAX(rollout_ordinal), COUNT(*) FROM thread_items GROUP BY thread_id")
     item_marks = {row[0]: (row[1], row[2]) for row in hist_cur.fetchall()}
 
+    # Codex owns the project list; the app-server's project/list is the only
+    # source that sees creations and deletions. threads.project_id is NULL for
+    # every row, so membership is decided by matching the thread cwd against
+    # the published project roots. A thread whose cwd no longer belongs to any
+    # project lists ungrouped, exactly where Codex Desktop shows it.
+    live_projects = codex_live.scan_projects()
+    live_doc = codex_live.read()
+    if live_projects is None:
+        live_projects = live_doc.get("projects") or {}
+    # The previous registry document, read once: stable createdAt/updatedAt
+    # keep workspace.json byte-identical across idle sweeps, which is what
+    # lets the host's file watcher stay quiet.
+    previous_ws_entries = {}
+    try:
+        with open(os.path.join(STORAGES_ROOT, "workspace.json"), "r", encoding="utf-8") as handle:
+            previous_ws_entries = (json.load(handle).get("tables", {}).get("workspaces") or {})
+    except Exception:
+        pass
     groups = {}
+    loose = []
     for th in threads:
         th_id, title, name, created_at, updated_at, cwd, project_id, rollout_path = th
         if not cwd:
             cwd = "/home/nahida/agents/sever"
-        proj_name = db_projects.get(project_id) or os.path.basename(cwd.rstrip("/")) or "home"
+        proj_name = live_projects.get(cwd)
+        if proj_name is None:
+            loose.append(th)
+            continue
         groups.setdefault(proj_name, {"title": proj_name, "path": cwd, "threads": []})
         groups[proj_name]["threads"].append(th)
 
     workspace_table = {}
     workspace_ids = []
     proj_cache_sessions = {}
+    titles = {}
+    derived_slugs = set()
     now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
 
-    for proj_name, ginfo in groups.items():
+    for proj_name, ginfo in list(groups.items()) + [("", {"title": "", "path": None, "threads": loose})]:
         cwd = ginfo["path"]
-        ws_slug = "--" + cwd.strip("/").replace("/", "-") + "--"
+        # The storage layer derives every session directory from the header
+        # cwd, so the loose bucket shares the fallback root's directory; the
+        # web grouping comes from workspace.json membership, not the folder.
+        ws_slug = "--" + (cwd or "/home/nahida/agents/sever").strip("/").replace("/", "-") + "--"
+        derived_slugs.add(ws_slug)
         ws_dir = os.path.join(SESSIONS_ROOT, ws_slug)
         os.makedirs(ws_dir, exist_ok=True)
-        ws_id = str(uuid.uuid5(uuid.NAMESPACE_URL, proj_name + cwd))
-        workspace_ids.append(ws_id)
+        ws_id = str(uuid.uuid5(uuid.NAMESPACE_URL, proj_name + (cwd or "")))
+        # Session headers and projection identities carry a cwd the storage
+        # layer requires to be a string; the loose bucket has no directory of
+        # its own, so its sessions borrow the fallback root.
+        cwd = cwd or "/home/nahida/agents/sever"
+        if proj_name:
+            workspace_ids.append(ws_id)
 
         sess_ids = []
         for th in ginfo["threads"]:
@@ -613,6 +653,7 @@ def run():
             jsonl_file = os.path.join(sess_path, "session.jsonl")
 
             label = clean_title(name, title)
+            titles[sess_dir_name] = label
             c_ms = int(created_at * 1000) if created_at else int(time.time() * 1000)
             st = states.get(sess_dir_name)
             mark = item_marks.get(th_id)
@@ -958,10 +999,29 @@ def run():
             cx["rolloutMtime"] = rollout_mtime
             states[sess_dir_name] = cx
 
-        workspace_table[ws_id] = {
-            "path": cwd, "title": proj_name, "sessionIds": sess_ids,
-            "createdAt": now_iso, "updatedAt": now_iso,
-        }
+        if proj_name:
+            workspace_table[ws_id] = {
+                "path": cwd, "title": proj_name, "sessionIds": sess_ids,
+                "createdAt": (previous_ws_entries.get(ws_id) or {}).get("createdAt") or now_iso,
+                "updatedAt": now_iso if (
+                    (previous_ws_entries.get(ws_id) or {}).get("sessionIds") != sess_ids
+                    or (previous_ws_entries.get(ws_id) or {}).get("title") != proj_name
+                ) else (previous_ws_entries.get(ws_id) or {}).get("updatedAt") or now_iso,
+            }
+
+    # Session directories of threads Codex no longer knows about would keep
+    # listing forever otherwise: persistence.list() walks every directory under
+    # the sessions root, not just the ones a workspace references.
+    for slug in os.listdir(SESSIONS_ROOT):
+        slug_dir = os.path.join(SESSIONS_ROOT, slug)
+        if not os.path.isdir(slug_dir):
+            continue
+        for entry in os.listdir(slug_dir):
+            if not entry.startswith("session-") or entry in known_session_ids:
+                continue
+            stale = os.path.join(slug_dir, entry)
+            if os.path.isdir(stale):
+                shutil.rmtree(stale, ignore_errors=True)
 
     hist_conn.close()
 
@@ -972,24 +1032,61 @@ def run():
     workspace_file = os.path.join(STORAGES_ROOT, "workspace.json")
     carried_ids = []
     carried = {}
+    seen_paths = set()
     try:
         with open(workspace_file, "r", encoding="utf-8") as handle:
             previous = json.load(handle)
+        previous_global = previous.get("global") or {}
+        seen_paths = set(previous_global.get("projectsSeen") or [])
+        has_seen = "projectsSeen" in previous_global
         derived_paths = {entry["path"] for entry in workspace_table.values()}
         for ws_id, entry in (previous.get("tables", {}).get("workspaces") or {}).items():
             if entry.get("path") in derived_paths:
                 continue
+            # A row Codex owns must die with its project; only rows the web
+            # added by hand survive. projectsSeen records every path that was
+            # ever a Codex project root, so a path that left the project list
+            # is a deletion, while a path Codex never owned is hand-added.
+            # Before the first seen-set exists, a live directory is the only
+            # evidence available, which is what the migration run uses.
+            if not entry.get("webAdded"):
+                path = entry.get("path") or ""
+                if has_seen:
+                    keep = path not in seen_paths and os.path.isdir(path)
+                else:
+                    keep = os.path.isdir(path)
+                if not keep:
+                    continue
+                entry = {**entry, "webAdded": True}
             carried[ws_id] = entry
             carried_ids.append(ws_id)
     except Exception:
         pass
+
+    # Whole workspace slugs Codex no longer derives (a deleted project, or a
+    # grouping that moved to the ungrouped bucket) keep their session folders
+    # on disk, and persistence.list() walks every folder under the sessions
+    # root. Dropping the slug drops the ghost listing; the threads it held are
+    # re-projected into their new bucket on the next pass because their new
+    # session file does not exist yet. Slugs of hand-added workspaces stay:
+    # their sessions live only there.
+    keep_slugs = set(derived_slugs)
+    for entry in carried.values():
+        keep_slugs.add("--" + (entry.get("path") or "").strip("/").replace("/", "-") + "--")
+    for slug in os.listdir(SESSIONS_ROOT):
+        if slug in keep_slugs:
+            continue
+        slug_dir = os.path.join(SESSIONS_ROOT, slug)
+        if os.path.isdir(slug_dir):
+            shutil.rmtree(slug_dir, ignore_errors=True)
 
     with open(workspace_file, "w", encoding="utf-8") as handle:
         json.dump({
             "unit": {"name": "workspace", "version": 2},
             "global": {"initialized": True,
                        "workspaceIds": workspace_ids + carried_ids,
-                       "archivedSessionIds": archived_session_ids},
+                       "archivedSessionIds": archived_session_ids,
+                       "projectsSeen": sorted(seen_paths | set(live_projects))},
             "tables": {"workspaces": {**workspace_table, **carried}},
         }, handle, ensure_ascii=False, indent=2)
 
@@ -1002,6 +1099,10 @@ def run():
 
     with open(STATE_FILE, "w", encoding="utf-8") as handle:
         json.dump(states, handle, ensure_ascii=False)
+
+    # One small document the host process reads to answer "which conversations
+    # are running" and "what is this session called" without touching Codex.
+    codex_live.publish(codex_live.scan_running(), live_projects or None, titles)
 
     fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
     lock_fh.close()

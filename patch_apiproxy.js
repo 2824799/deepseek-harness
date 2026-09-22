@@ -37,6 +37,7 @@ function ensure(needle, apply) {
 // installed the tailer import while the bridge import still named an older,
 // shorter hook list, and guarding on one line alone left the other stale.
 const BRIDGE_IMPORT = `import { handleCodexPrompt, handleCodexArchive, handleCodexRename, handleCodexCreate, handleCodexFork, handleCodexCancel, handleCodexModel, handleCodexModelState } from "${BRIDGE}";`;
+const LIVE_IMPORT = `import { codexSessionListExtras, codexWorkspaceSnapshot, codexWatchLive } from "${BRIDGE}";`;
 const TAILER_IMPORT = `import { startCodexTailer } from "${TAILER}";`;
 if (!code.includes(BRIDGE_IMPORT)) {
   const existing = code.match(/^import \{ handleCodex[A-Za-z, ]*\} from "[^"\n]*";$/m);
@@ -55,6 +56,13 @@ if (!code.includes(TAILER_IMPORT)) {
   }
   changed = true;
   console.log('  applied: tailer import');
+}
+if (!code.includes(LIVE_IMPORT)) {
+  const tailerIdx = code.indexOf(TAILER_IMPORT);
+  const at = code.indexOf('\n', tailerIdx) + 1;
+  code = code.slice(0, at) + LIVE_IMPORT + '\n' + code.slice(at);
+  changed = true;
+  console.log('  applied: live import');
 }
 
 // --- 2. session.prompt -> Codex ----------------------------------------
@@ -246,6 +254,105 @@ const GATEWAY = '/home/nahida/.local/lib/node_modules/@deepseek-ai/dsh/node_modu
       console.log('  applied: gateway /permission hook');
     } else {
       console.error('  MISS: gateway anchors not found');
+      process.exitCode = 1;
+    }
+  }
+}
+
+// --- 11. session.list rows carry Codex's running flag and title ---------
+// The stock summary answers running:false for every cold session because no
+// DSH agent is attached, and it carries no title at all, so the sidebar fell
+// back to the directory basename. Both facts live in the projector's
+// live-state.json; merging them here keeps the listing honest on every poll.
+ensure('codexSessionListExtras(item.sessionId)', () => code.replace(
+  'items.sort((a, b) => b.updatedAt - a.updatedAt);\n\t\treturn items;',
+  `items.sort((a, b) => b.updatedAt - a.updatedAt);
+\t\tif (${GUARD}) for (const item of items) Object.assign(item, codexSessionListExtras(item.sessionId));
+\t\treturn items;`));
+
+// --- 12. workspace.list reads the projector's file ----------------------
+// The registry caches workspace.json once at boot, so a project Codex deleted
+// kept listing until the host restarted. The projector rewrites the file on
+// every sweep; serving it straight from disk makes the sidebar follow Codex.
+ensure('codexWorkspaceSnapshot()', () => code.replace(
+  `\t\tworkspace: {
+\t\t\tlist(request) {
+\t\t\t\treturn Promise.resolve(ok(request, {
+\t\t\t\t\titems: ctx.workspaceRegistry.list().map(workspaceView),
+\t\t\t\t\tarchivedSessionIds: [...ctx.workspaceRegistry.archivedSessionIds]
+\t\t\t\t}));
+\t\t\t},`,
+  `\t\tworkspace: {
+\t\t\tlist(request) {
+\t\t\t\tif (${GUARD}) {
+\t\t\t\t\tconst snapshot = codexWorkspaceSnapshot();
+\t\t\t\t\tif (snapshot) return Promise.resolve(ok(request, snapshot));
+\t\t\t\t}
+\t\t\t\treturn Promise.resolve(ok(request, {
+\t\t\t\t\titems: ctx.workspaceRegistry.list().map(workspaceView),
+\t\t\t\t\tarchivedSessionIds: [...ctx.workspaceRegistry.archivedSessionIds]
+\t\t\t\t}));
+\t\t\t},`));
+
+// --- 13. host stream pushes projector rewrites to open pages ------------
+// The host stream replays its committed registry state on connect and then
+// only reacts to in-process events, so a projector rewrite never reached an
+// open page. The watcher re-pushes the frame shapes the client already
+// handles whenever the projector's files change on disk.
+ensure('codexWatchLive(() => {', () => code.replace(
+  `\t\t\t\treturn queue.iterate(signal, () => {
+\t\t\t\t\tfor (const dispose of disposers) dispose();
+\t\t\t\t});`,
+  `\t\t\t\tif (${GUARD}) disposers.push(codexWatchLive(() => {
+\t\t\t\t\tconst snapshot = codexWorkspaceSnapshot();
+\t\t\t\t\tif (!snapshot) return;
+\t\t\t\t\tfor (const workspace of snapshot.items) queue.push(frame({
+\t\t\t\t\t\ttype: "host/workspace-changed",
+\t\t\t\t\t\tworkspace
+\t\t\t\t\t}));
+\t\t\t\t\tqueue.push(frame({
+\t\t\t\t\t\ttype: "host/archived-sessions-changed",
+\t\t\t\t\t\tarchivedSessionIds: [...snapshot.archivedSessionIds]
+\t\t\t\t\t}));
+\t\t\t\t}));
+\t\t\t\treturn queue.iterate(signal, () => {
+\t\t\t\t\tfor (const dispose of disposers) dispose();
+\t\t\t\t});`));
+
+// --- 14. client accepts the extra session.list columns ------------------
+{
+  const CC = '/home/nahida/.local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-client-connection/lib/client.js';
+  let ccode = fs.readFileSync(CC, 'utf-8');
+  const NEEDLE = 'agentPreset: string().optional(),\n\t\t\tprojections: lazy(() => sessionProjectionsBlockSchema).optional()';
+  if (!ccode.includes('title: string().optional(),')) {
+    if (ccode.includes(NEEDLE)) {
+      ccode = ccode.replace(NEEDLE, 'agentPreset: string().optional(),\n\t\t\ttitle: string().optional(),\n\t\t\tprojections: lazy(() => sessionProjectionsBlockSchema).optional()');
+      fs.writeFileSync(CC, ccode, 'utf-8');
+      console.log('  applied: client session summary title column');
+    } else {
+      console.error('  MISS: client session summary anchor');
+      process.exitCode = 1;
+    }
+  }
+}
+
+// --- 15. client keeps the session list fresh while the page is open -----
+{
+  const CR = '/home/nahida/.local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-client-runtime/lib/client.js';
+  let rcode = fs.readFileSync(CR, 'utf-8');
+  if (!rcode.includes('codexListTimer')) {
+    const anchor = '\t\t\trefreshList() {\n\t\t\t\tif (this.listInflight !== null) return this.listInflight;\n\t\t\t\tthis.listState = "loading";';
+    if (rcode.includes(anchor)) {
+      rcode = rcode.replace(anchor, `\t\t\trefreshList(silent = false) {
+\t\t\t\tif (this.codexListTimer === void 0) this.codexListTimer = setInterval(() => {
+\t\t\t\t\tif (this.listInflight === null) this.refreshList(true);
+\t\t\t\t}, 2000);
+\t\t\t\tif (this.listInflight !== null) return this.listInflight;
+\t\t\t\tif (!silent) this.listState = "loading";`);
+      fs.writeFileSync(CR, rcode, 'utf-8');
+      console.log('  applied: client silent list poll');
+    } else {
+      console.error('  MISS: client refreshList anchor');
       process.exitCode = 1;
     }
   }

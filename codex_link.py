@@ -279,13 +279,14 @@ class WSClient:
             pass
 
 
-def connect(timeout=10.0):
+def connect(timeout=10.0, experimental=False):
     ws = WSClient(timeout=timeout)
-    res = ws.call(
-        "initialize",
-        {"clientInfo": {"name": "dsh-web-edition", "title": "DSH Web Edition", "version": "0.1.0"}},
-        timeout=timeout,
-    )
+    params = {"clientInfo": {"name": "dsh-web-edition", "title": "DSH Web Edition", "version": "0.1.0"}}
+    if experimental:
+        # The app-server gates project/* behind the experimentalApi capability;
+        # without it project/list answers -32600 "requires experimentalApi".
+        params["capabilities"] = {"experimentalApi": True, "requestAttestation": False}
+    res = ws.call("initialize", params, timeout=timeout)
     if not res["ok"]:
         raise WSError(f"initialize failed: {res['error']}")
     ws.notify("initialized")
@@ -396,11 +397,18 @@ def send_prompt(thread_id, payload):
                 # Codex Desktop holds the writer lock for this thread; the only
                 # supported channel is the durable queue, which Desktop drains.
                 return queue_prompt(thread_id, items, reason)
-            if "no rollout found" not in reason:
+            if "no rollout found" not in reason and "thread not found" not in reason:
                 return {"ok": False, "error": reason}
             # A thread created moments ago has no rollout file yet, so resume
             # has nothing to attach to. turn/start loads it itself, which is
             # exactly what the first message of a new conversation needs.
+            # A blank web row whose thread was reaped before its first message
+            # arrives here too: recreate it so the message still lands.
+            if "thread not found" in reason:
+                created = create_thread({"cwd": thread_cwd(thread_id)})
+                if not created.get("ok"):
+                    return {"ok": False, "error": reason}
+                thread_id = created["threadId"]
 
         active_turn, _ = thread_is_running(ws, thread_id)
         if active_turn:
@@ -500,6 +508,21 @@ def create_thread(payload):
         return {"ok": True, "threadId": thread_id, "sessionId": thread.get("sessionId")}
     finally:
         ws.close()
+
+
+def thread_cwd(thread_id):
+    """The working directory a projected session belongs to, from the registry."""
+    session_id = thread_id if thread_id.startswith("session-") else "session-" + thread_id
+    try:
+        with open(os.path.join(os.path.dirname(SELECTION_FILE), "storages", "workspace.json"),
+                  encoding="utf-8") as handle:
+            tables = (json.load(handle).get("tables", {}).get("workspaces") or {})
+    except Exception:
+        return None
+    for entry in tables.values():
+        if session_id in (entry.get("sessionIds") or []):
+            return entry.get("path")
+    return None
 
 
 def rename_thread(thread_id, title):
