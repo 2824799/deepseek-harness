@@ -3,6 +3,7 @@
 set -u
 
 unit=codex-dsh-web.service
+sync_unit=codex-dsh-sync.service
 journal_pid=
 started=false
 lock_file=/home/nahida/.cache/codex-dsh-web-terminal.lock
@@ -21,7 +22,7 @@ cleanup() {
     wait "$journal_pid" 2>/dev/null || true
   fi
   if [[ "$started" == true ]]; then
-    echo '正在停止 DSH 后台...'
+    echo '正在停止 DSH 网页与同步后台...'
     systemctl --user stop "$unit"
   fi
 }
@@ -32,11 +33,11 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 echo '启动 DSH 网页后台（端口 3080）'
-echo "关闭这个终端会停止 $unit。"
+echo "关闭这个终端会停止网页与同步服务。"
 echo
 
 # Start following before the unit so its earliest startup output is visible.
-journalctl --user -u "$unit" -n 0 -f --output=cat &
+journalctl --user -u "$unit" -u "$sync_unit" -n 0 -f --output=cat &
 journal_pid=$!
 
 started=true

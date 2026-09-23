@@ -835,6 +835,9 @@ def run():
                     and st.get("mark") == (list(mark) if mark is not None else None)
                     and st.get("rolloutMtime") == rollout_mtime
                     and st.get("label") == label
+                    # Older projector passes retained a completed reasoning
+                    # item without publishing it until the next tool or answer.
+                    and not st.get("pending")
                     # A permission switch changes nothing Codex records in the
                     # rollout, so this is the only signal that the picker moved.
                     and st.get("perm") == permission_presets.get(th_id, "danger-full-access")):
@@ -866,16 +869,21 @@ def run():
                 # of truth for that gap; history remains the source below its
                 # high-water ordinal so the same item is never projected twice.
                 items = sorted([*items, *recovered], key=lambda it: it[2])
-            # A thread with no recorded items cannot be projected: listing it
-            # would make the browser request a log that does not exist and show
-            # "history unavailable".
+            # The history index can lag or be empty for a thread whose rollout
+            # already supplied items. Once those ordinals are checkpointed,
+            # the next sweep recovers no new items; keep its existing log.
+            existing_rollout_log = (st is not None and os.path.exists(jsonl_file)
+                                    and st.get("version") == PROJECTION_VERSION
+                                    and st.get("last_ordinal", -1) >= 0)
             if not items:
-                try:
-                    os.rmdir(sess_path)
-                except OSError:
-                    pass
-                states.pop(sess_dir_name, None)
-                continue
+                if not existing_rollout_log:
+                    # A genuinely blank thread has no conversation to list.
+                    try:
+                        os.rmdir(sess_path)
+                    except OSError:
+                        pass
+                    states.pop(sess_dir_name, None)
+                    continue
             sess_ids.append(sess_dir_name)
 
             proj_cache_sessions[sess_dir_name] = {
@@ -991,6 +999,25 @@ def run():
                 emit(cx, out, {"type": "step/start", "time": start_time,
                                "data": {"turn": cx["turn"], "step": cx["step"]}})
 
+            def show_reasoning(text, when):
+                if not cx["step_open"]:
+                    open_step(when)
+                emit(cx, out, {
+                    "type": "assistant/message", "time": when,
+                    "data": {"turn": cx["turn"], "step": cx["step"], "stream": [],
+                             "message": {"id": str(uuid.uuid4()), "role": "assistant",
+                                         "content": [{"type": "reasoning", "text": text}],
+                                         "source": dict(MODEL_SOURCE)}},
+                    "surfaceOp": "append",
+                })
+
+            if cx["pending"]:
+                # Publish reasoning held by an earlier pass before any later
+                # item; its ordinal was already committed to the checkpoint.
+                show_reasoning(NEWLINE.join(cx["pending"]).strip(),
+                               cx.get("last_time") or c_ms)
+                cx["pending"] = []
+
             for it in items:
                 item_id, item_type, ord_val, created_ms, raw_json_str, item_turn_id = it
                 if ord_val <= cx["last_ordinal"]:
@@ -1054,7 +1081,7 @@ def run():
                 elif item_type == "reasoning":
                     r_text = reasoning_text(data)
                     if r_text:
-                        cx["pending"].append(r_text)
+                        show_reasoning(r_text, created_ms)
 
                 elif item_type in TOOL_ITEM_TYPES:
                     row = tool_row(item_type, data)

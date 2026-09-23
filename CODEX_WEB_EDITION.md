@@ -62,6 +62,11 @@ history items. The browser follows the projected JSONL by byte offset.
 Codex sends token deltas on the socket that started a web turn. The detached
 stream follower forwards these deltas through a local Unix socket. The sync
 daemon writes them into the same projected log as the structural events.
+Desktop-owned turns are read from completed rollout items; a completed
+reasoning item is published immediately, even when the next tool or answer has
+not arrived. An older checkpoint holding unpublished reasoning is drained on
+the next sweep. A projected session remains listed while Codex's history index
+lags behind its rollout, including an index with no rows for that thread.
 Unchanged workspace, projection-cache and checkpoint files are not rewritten.
 
 On the current dataset, an isolated warm sweep costs about 50 ms CPU, compared
@@ -84,8 +89,11 @@ Reasoning text is requested with detailed summaries when the model exposes it.
 ## Services
 
 The desktop launcher in the Desktop folder opens Konsole, starts the 3080 web
-service, and follows its journal output. Closing that terminal stops the web
-service. Its command is maintained in scripts/start-codex-dsh-web-terminal.sh.
+service and its required sync daemon, and follows both journals. Closing that
+terminal stops both services. Install the user-service dependencies with
+`scripts/install-codex-dsh-service-dependencies.sh`; the launcher command is
+maintained in scripts/start-codex-dsh-web-terminal.sh. The sync daemon does not
+start by itself on login, so an inactive web UI cannot leave it running.
 
 ```
 systemctl --user status codex-dsh-appserver.service   # Codex app-server (45880)
