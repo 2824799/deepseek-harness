@@ -83,6 +83,10 @@ Reasoning text is requested with detailed summaries when the model exposes it.
 
 ## Services
 
+The desktop launcher in the Desktop folder opens Konsole, starts the 3080 web
+service, and follows its journal output. Closing that terminal stops the web
+service. Its command is maintained in scripts/start-codex-dsh-web-terminal.sh.
+
 ```
 systemctl --user status codex-dsh-appserver.service   # Codex app-server (45880)
 systemctl --user status codex-dsh-web.service         # DSH web UI (3080)

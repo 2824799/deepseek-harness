@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=启动 DSH 后台
+Comment=在终端查看 Codex 网页版 DSH 日志；关闭终端即停止后台
+Exec=/usr/bin/konsole -e /usr/bin/bash /home/nahida/agents/sever/dsh/scripts/start-codex-dsh-web-terminal.sh
+TryExec=/usr/bin/konsole
+Icon=utilities-terminal
+Terminal=false
+StartupNotify=true
+Categories=Development;
