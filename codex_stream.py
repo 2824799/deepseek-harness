@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
-"""Token-level streaming of a live Codex turn into the DSH session log.
+"""Forward token-level Codex turn deltas to the single projection writer.
 
 Codex delivers item/agentMessage/delta and item/reasoning/*Delta notifications
 only on the app-server connection that submitted the turn, so the process that
-calls turn/start hands its socket to a detached child which appends those deltas
-as assistant/chunk events. The projector keeps writing the structural events
-around them.
-
-Two processes therefore append to one log. Both take an exclusive lock on it and
-re-read its tail before writing, so sequence numbers stay monotonic and a chunk
-can only land inside a step that is actually open.
+calls turn/start hands its socket to a detached child. That child forwards
+deltas to the sync daemon over a local socket. The daemon alone writes the
+projected log, including its structural events.
 """
 
 import fcntl
@@ -18,7 +14,8 @@ import os
 import time
 
 NEWLINE = chr(10)
-SESSIONS_ROOT = "/home/nahida/agents/sever/dsh/.dsh-codex/sessions"
+SESSIONS_ROOT = os.path.join(os.environ.get("DSH_HOME") or
+                             "/home/nahida/agents/sever/dsh/.dsh-codex", "sessions")
 TAIL_WINDOW = 1 << 20
 STRUCTURAL = ("turn/start", "turn/end", "step/start", "step/end")
 IDLE_TIMEOUT_S = 300
@@ -314,11 +311,12 @@ def stream_turn(ws, thread_id, session_id, base_turn, turn_id=None):
         return index
 
     def flush():
-        """Append what is buffered. True means the buffer was consumed or dropped."""
+        """Forward buffered Codex deltas to the projection writer."""
         if not buffer:
             return True
-        result = _locked_append(
-            path, _chunk_events(buffer), fill_placement=True,
+        from projection_writer import send_chunks
+        result = send_chunks(
+            session_id, buffer,
             min_turn=base_turn if placement["turn"] is None else None,
             only_turn=placement["turn"])
         _debug(f"flush n={len(buffer)} placement={placement} result={result}")

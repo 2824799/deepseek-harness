@@ -14,6 +14,15 @@ function pendingThreads() {
   catch { return {}; }
 }
 
+/** Blank Codex thread while the sync daemon has not materialized its log. */
+export function codexPendingMeta(sessionId) {
+  if (typeof sessionId !== "string" || !sessionId.startsWith("session-")) return null;
+  const entry = pendingThreads()[sessionId.slice(8)];
+  if (!entry || typeof entry.cwd !== "string" || typeof entry.createdAt !== "number") return null;
+  return { id: sessionId, version: 0, createdAt: Math.floor(entry.createdAt * 1000),
+    cwd: entry.cwd, delegationDepth: 0, agentPreset: "standard" };
+}
+
 let liveCache = { mtime: 0, doc: {} };
 
 /** Read the projector's live-state document, cached on mtime. */
@@ -39,8 +48,13 @@ export function codexSessionListExtras(sessionId) {
   const doc = codexLiveState();
   const running = Array.isArray(doc.running) && doc.running.includes(sessionId.replace(/^session-/, ""));
   const title = (doc.titles || {})[sessionId];
+  // DSH caches cold-session metadata at host startup and probes only small
+  // files. A newly written Codex turn can otherwise remain blank until the
+  // host restarts, even though its projected JSONL already has turn/start.
+  const started = Array.isArray(doc.startedSessions) && doc.startedSessions.includes(sessionId);
   return {
     running,
+    ...started ? { blank: false } : {},
     ...title === undefined ? {} : { title }
   };
 }
@@ -167,6 +181,18 @@ export function handleCodexArchive(sessionId) {
     return JSON.parse((res.stdout || "").trim());
   } catch (e) {
     return { ok: false, error: res.stderr || res.stdout || String(e) };
+  }
+}
+
+/** Submit workspace mutations to Codex; the sync daemon owns the DSH snapshot. */
+export function handleCodexWorkspace(action, payload) {
+  const res = cp.spawnSync("python3", [
+    "/home/nahida/agents/sever/dsh/codex_projects.py", action, JSON.stringify(payload)
+  ], { encoding: "utf-8", timeout: 30000 });
+  try {
+    return JSON.parse((res.stdout || "").trim());
+  } catch (error) {
+    return { ok: false, error: res.stderr || res.error?.message || String(error) };
   }
 }
 

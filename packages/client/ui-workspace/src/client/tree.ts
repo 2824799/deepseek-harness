@@ -1,7 +1,7 @@
 /**
  * Derives the workspace browser tree from caller-projected Workspace and
- * Session order. Unassigned Sessions trail under Ungrouped; only the selected
- * blank Session remains visible.
+ * Session order. Unassigned Sessions trail under Ungrouped. The Codex web
+ * edition keeps a selected blank Session out of the sidebar until first send.
  */
 import {
   type SessionListState, type SessionSearchResultItem, type SessionSummary,
@@ -200,15 +200,16 @@ export function pinCurrentBlank(
 }
 
 /**
- * Ordinary sessions are visible; among blank sessions, only the current one
- * is visible. Subagent children use their parent header catalog; archived
+ * Ordinary sessions are visible; outside the Codex web edition, only the
+ * current blank session is visible. Subagent children use their parent header catalog; archived
  * sessions are visible nowhere, while their accounting slots remain so
  * unarchiving restores position.
  */
 function sessionVisible(session: SessionSummary, current: SessionId | undefined, archived: ReadonlySet<SessionId>): boolean {
+  const hideBlankUntilFirstPrompt = typeof window !== 'undefined' && window.location.port === '3080'
   return session.origin !== 'subagent'
     && !archived.has(session.id)
-    && (!session.blank || session.id === current)
+    && (!session.blank || (!hideBlankUntilFirstPrompt && session.id === current))
 }
 
 /**
@@ -336,8 +337,9 @@ function sessionNode(
  * Derive the workspace browser groups with every session as a top-level row.
  *
  * Every group shows; sessions populate under expanded groups in the selected
- * local order. Blank sessions are excluded except for the selected
- * provisional New Session row; archived sessions are excluded everywhere.
+ * local order. The Codex web edition excludes blank sessions until their first
+ * prompt; other editions keep the selected provisional New Session row.
+ * Archived sessions are excluded everywhere.
  * Content search lives outside this derivation
  * (see {@link deriveSearchResults}).
  * @param list - sessions list snapshot (`mainView` retention feeds containsCurrent).

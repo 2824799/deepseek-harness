@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import type { SessionListState, SessionSummary } from '@deepseek-ai/dsh-api-session-controller/client'
 import type { WorkspaceId, WorkspaceView } from '@deepseek-ai/dsh-api-workspace-controller/client'
 import type {
@@ -171,6 +171,27 @@ describe('deriveGroups', () => {
       [workspace('first', [])], noArchive, noAttention, view(),
     )
     expect(strayGroups.map(group => group.key)).toEqual(['first'])
+  })
+
+  it('keeps Codex web blank sessions out of the sidebar until the first prompt', () => {
+    const originalWindow = globalThis.window
+    vi.stubGlobal('window', { location: { port: '3080' } })
+    try {
+      const blank = { ...summary('blank', 5), blank: true, retainedBy: { mainView: 1 } }
+      const real = summary('history', 4)
+      const sessions = list(blank, real)
+      const groups = deriveGroups(
+        sessions, [workspace('first', ['blank', 'history'])], noArchive, noAttention, view(['first']),
+      )
+      expect(groups[0]!.sessions.map(session => session.id)).toEqual([real.id])
+      expect(visibleSessionIds(sessions, noArchive)).toEqual([real.id])
+      const sent = list({ ...blank, blank: false }, real)
+      expect(deriveGroups(
+        sent, [workspace('first', ['blank', 'history'])], noArchive, noAttention, view(['first']),
+      )[0]!.sessions.map(session => session.id)).toEqual([blank.id, real.id])
+    } finally {
+      vi.stubGlobal('window', originalWindow)
+    }
   })
 
   it('projects the completion reminder into session and search rows (absent = false)', () => {

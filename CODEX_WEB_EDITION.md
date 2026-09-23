@@ -13,9 +13,19 @@ page is only a view and an input surface for it.
 | App-server | `ws://127.0.0.1:45880` | Codex JSON-RPC channel the bridge talks to |
 | Bridge | `codex_link.py`, `codex_bridge.py` | Executes web actions through Codex |
 | Projection | `setup_isolated.py` | Turns Codex threads into DSH session logs |
-| Streaming | `codex_stream.py` | Follows a live turn's token deltas into that log |
+| Streaming | codex_stream.py and projection_writer.py | Forward live Codex deltas to one projection writer |
 | Live push | `codex_tailer.js` | Streams new Codex events into the browser |
 | Patching | `patch_apiproxy.js` | Idempotently installs the host hooks |
+
+Workspace creation, rename, deletion, and ordering go through Codex's
+experimental project APIs. Moving a conversation to a project updates its
+Codex thread metadata. The browser never writes the projected workspace
+registry or session logs. The sync daemon alone refreshes these read models
+from Codex, including empty projects and project removals. Existing projected
+workspace IDs are retained for paths still present in Codex.
+Codex supports changing a conversation's project but has no manual
+conversation-order API; a manual reorder request returns an error before it
+changes project membership.
 
 ## What the web controls
 
@@ -27,34 +37,39 @@ page is only a view and an input surface for it.
 | Permission preset | recorded per thread, sent as `sandboxPolicy` + `approvalPolicy` |
 | Rename | `thread/name/set` |
 | Archive / unarchive | `thread/archive`, with a state-table fallback for open threads |
-| Fork | `thread/fork` |
+| Fork | Codex thread/fork for latest state; historical anchors return an explicit error |
 | New conversation | `thread/start` |
 | Images | forwarded as `image` input parts |
 
 For a new conversation, the host resolves the selected workspace id to its
-directory before starting a Codex thread. A blank thread has no Codex history
-yet, so codex_pending.py records its workspace and a minimal session header in
-the isolated web state. The projector keeps that record until the first turn
-is available, then replaces it with Codex's history. This keeps the workspace
-selection stable across sidebar updates and page reloads.
+directory before starting a Codex thread. The pending control file records a
+blank Codex thread's workspace. Only the sync daemon creates its projected
+session header; a page opened before that sweep gets a temporary read-only
+header from the pending control file. The sidebar hides the blank thread until
+its first message is projected.
 
-Every one of these writes to Codex only. The DSH session log is a read model the
-projector owns, so no control path may resume a DSH agent: a second writer would
-collide with the projector's sequence numbers and the browser would reject the
-whole conversation as corrupt.
+Conversation actions are sent to Codex. The projected session log is owned by
+the sync daemon. A DSH agent must not resume it, because a second writer would
+collide with the projector's sequence numbers.
 
 ## Live conversation
 
-`session/event` frames reach the page over the mux WebSocket. The projector
-polls Codex every 700 ms, and `codex_tailer.js` follows the projected files by
-offset, so a reply appears within roughly a second. Token-level output needs the
-turn's own connection: Codex emits deltas only on the socket that submitted the
-turn, so `codex_stream.py` inherits that socket in a detached child and appends
-the deltas under the log's lock while the projector writes the structure around
-them.
+The sync daemon checks Codex threads every 700 ms and refreshes the project
+list at most once every 3 seconds. It keeps per-rollout byte cursors
+across sweeps and skips unchanged sessions, including those without SQLite
+history items. The browser follows the projected JSONL by byte offset.
 
-Reasoning text is requested with `summary: "detailed"`; without it Codex sends
-the reasoning item empty and the thinking panel stays blank.
+Codex sends token deltas on the socket that started a web turn. The detached
+stream follower forwards these deltas through a local Unix socket. The sync
+daemon writes them into the same projected log as the structural events.
+Unchanged workspace, projection-cache and checkpoint files are not rewritten.
+
+On the current dataset, an isolated warm sweep costs about 50 ms CPU, compared
+with about 470 ms before these changes. The first sweep still parses backlog,
+and the projected logs still use disk space. This benchmark does not establish
+Codex Desktop's internal CPU use.
+
+Reasoning text is requested with detailed summaries when the model exposes it.
 
 ## How a message travels
 
@@ -78,6 +93,7 @@ systemctl --user status codex-dsh-sync.service        # projection daemon
 
 ```
 node /home/nahida/agents/sever/dsh/patch_apiproxy.js
+node /home/nahida/agents/sever/dsh/patch_workspace_rows.js
 systemctl --user restart codex-dsh-web.service
 ```
 

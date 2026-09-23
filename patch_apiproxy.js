@@ -32,11 +32,17 @@ function ensure(needle, apply) {
   console.log('  applied:', JSON.stringify(needle).slice(0, 60));
 }
 
+const pendingImport = 'import { codexPendingMeta } from "' + BRIDGE + '";';
+if (!code.includes(pendingImport)) {
+  code = pendingImport + '\n' + code;
+  changed = true;
+}
+
 // --- 1. imports ---------------------------------------------------------
 // Both import lines are re-checked independently: an earlier run could have
 // installed the tailer import while the bridge import still named an older,
 // shorter hook list, and guarding on one line alone left the other stale.
-const BRIDGE_IMPORT = `import { handleCodexPrompt, handleCodexArchive, handleCodexRename, handleCodexCreate, handleCodexFork, handleCodexCancel, handleCodexModel, handleCodexModelState, codexModelCatalog } from "${BRIDGE}";`;
+const BRIDGE_IMPORT = `import { handleCodexPrompt, handleCodexArchive, handleCodexRename, handleCodexCreate, handleCodexFork, handleCodexCancel, handleCodexModel, handleCodexModelState, codexModelCatalog, handleCodexWorkspace } from "${BRIDGE}";`;
 const LIVE_IMPORT = `import { codexSessionListExtras, codexWorkspaceSnapshot, codexWatchLive } from "${BRIDGE}";`;
 const TAILER_IMPORT = `import { startCodexTailer } from "${TAILER}";`;
 if (!code.includes(BRIDGE_IMPORT)) {
@@ -81,10 +87,7 @@ ensure('handleCodexPrompt(sessionId, mode, content)', () => code.replace(
 \t\t\t\t}`));
 
 // --- 3. archive -> Codex ----------------------------------------------
-// Codex owns the archived flag, and the DSH registry is updated beside it so
-// the sidebar hides the conversation without waiting for a restart. Recording
-// it in the registry does not resume the session — it only records the id — so
-// this does not add a second writer to the projected log.
+// Codex owns the archived flag; the sync daemon updates the sidebar snapshot.
 ensure('handleCodexArchive(sessionId)', () => code.replace(
   `			async archiveSession(request) {
 				const { sessionId } = request.payload;`,
@@ -107,26 +110,28 @@ ensure('handleCodexArchive(sessionId)', () => code.replace(
 					return ok(request, { archivedSessionIds: [...ctx.workspaceRegistry.archivedSessionIds] });
 				}`));
 
+// Upgrade the older hook, which also wrote to DSH's workspace registry.
+ensure('codexArchiveSingleWriter', () => code.replace(
+  '\t\t\t\t\ttry {\n\t\t\t\t\t\tawait ctx.workspaceRegistry.archiveSession(sessionId);\n\t\t\t\t\t} catch (error) {\n\t\t\t\t\t\tif (!(error instanceof WorkspaceUnknownSessionError)) throw error;\n\t\t\t\t\t}\n\t\t\t\t\treturn ok(request, { archivedSessionIds: [...ctx.workspaceRegistry.archivedSessionIds] });',
+  '\t\t\t\t\tconst archivedIds = codexWorkspaceSnapshot()?.archivedSessionIds ?? []; // codexArchiveSingleWriter\n\t\t\t\t\treturn ok(request, { archivedSessionIds: [...new Set([...archivedIds, sessionId])] });',
+));
+
 // --- 4. rename -> Codex -----------------------------------------------
-// The Codex branch returns before the DSH title service runs. Renaming through
-// DSH resumes the session, which makes the host a second writer of the
-// projected session log and collides with the projector's sequence numbers;
-// the browser then rejects the whole log as corrupt. The projector reads the
-// Codex thread name on its next sweep, so the title still reaches the page.
-ensure('handleCodexRename(sessionId, title)', () => code.replace(
-  'const accepted = titles.rename(found.agent.session, title);',
-  `if (${GUARD}) {
-\t\t\t\t\tconst renamed = handleCodexRename(sessionId, title);
-\t\t\t\t\tif (!renamed || !renamed.ok) {
-\t\t\t\t\t\treturn err(request, {
-\t\t\t\t\t\t\tcode: "internal",
-\t\t\t\t\t\t\tmessage: "Codex rename failed: " + (renamed && renamed.error),
-\t\t\t\t\t\t\tdetails: { sessionId }
-\t\t\t\t\t\t});
-\t\t\t\t\t}
-\t\t\t\t\treturn ok(request, { title: title.trim(), seq: 3 });
-\t\t\t\t}
-\t\t\t\tconst accepted = titles.rename(found.agent.session, title);`));
+// The original rename hook sat below agentFor(), which resumed the DSH agent
+// and appended a session/end-seed into Codex's projected log. Intercept before
+// any DSH session resolution so the read model remains single-writer.
+ensure('codexRenameBeforeAgent', () => code.replace(
+  'async rename(request) {\n\t\t\t\tconst { sessionId, title } = request.payload;',
+  [
+    'async rename(request) {',
+    '\t\t\t\tconst { sessionId, title } = request.payload;',
+    '\t\t\t\tif (' + GUARD + ') { // codexRenameBeforeAgent',
+    '\t\t\t\t\tconst renamed = handleCodexRename(sessionId, title);',
+    '\t\t\t\t\tif (!renamed || !renamed.ok) return err(request, { code: "internal", message: "Codex rename failed: " + (renamed && renamed.error), details: { sessionId } });',
+    '\t\t\t\t\treturn ok(request, { title: title.trim(), seq: 3 });',
+    '\t\t\t\t}',
+  ].join('\n'),
+));
 
 // --- 5. session.create -> real Codex thread ---------------------------
 ensure('handleCodexCreate(', () => code.replace(
@@ -143,7 +148,7 @@ ensure('handleCodexCreate(', () => code.replace(
 
 // Workspace picks carry an id, not a cwd. Resolve against the live snapshot,
 // which also contains workspaces added from the browser.
-ensure('handleCodexCreate(cwd, request.payload.workspaceId)', () => code.replace(
+ensure('handleCodexCreate(cwd, workspaceId)', () => code.replace(
   'const created = handleCodexCreate(request.payload.cwd);',
   [
     'const workspaceId = request.payload.workspaceId;',
@@ -152,6 +157,24 @@ ensure('handleCodexCreate(cwd, request.payload.workspaceId)', () => code.replace
     'const cwd = selected?.path ?? request.payload.cwd;',
     'const created = handleCodexCreate(cwd, workspaceId);',
   ].join('\n\t\t\t\t\t'),
+));
+
+// A native DSH fork creates and writes a DSH-owned session. Codex mode must
+// create the child through Codex instead. The current bridge supports latest
+// state only; reject an anchored historical cut rather than silently forking
+// the wrong point in the conversation.
+ensure('codexForkBeforeDshWrite', () => code.replace(
+  'async fork(request) {\n\t\t\t\tconst { sessionId, atSeq } = request.payload;',
+  [
+    'async fork(request) {',
+    '\t\t\t\tconst { sessionId, atSeq } = request.payload;',
+    '\t\t\t\tif (' + GUARD + ') { // codexForkBeforeDshWrite',
+    '\t\t\t\t\tif (atSeq !== void 0) return err(request, { code: "fork-unavailable", message: "Forking from a historical event is not supported by the Codex bridge", details: { sessionId } });',
+    '\t\t\t\t\tconst forked = handleCodexFork(sessionId);',
+    '\t\t\t\t\tif (!forked || !forked.ok || !forked.threadId) return err(request, { code: "internal", message: "Codex fork failed: " + (forked && forked.error), details: { sessionId } });',
+    '\t\t\t\t\treturn ok(request, { sessionId: "session-" + forked.threadId });',
+    '\t\t\t\t}',
+  ].join('\n'),
 ));
 
 // --- 6. live tail of projected Codex events into the mux stream -------
@@ -297,7 +320,55 @@ ensure('codexSessionListExtras(item.sessionId)', () => code.replace(
 \t\tif (${GUARD}) for (const item of items) Object.assign(item, codexSessionListExtras(item.sessionId));
 \t\treturn items;`));
 
-// --- 12. workspace.list reads the projector's file ----------------------
+// --- 12. Codex history must bypass DSH's attached session snapshot -------
+// DSH can attach a projected session while it is still growing. Its attached
+// events then freeze at that sequence, and even persistence.inspect() returns
+// the same in-memory view. readFrom() reads the current physical log instead.
+ensure('codexReadStoredHistory', () => code.replace(
+  'async function historySourceFor(sessionId) {',
+  [
+    'async function historySourceFor(sessionId) {',
+    '\t\tif (' + GUARD + ') { // codexReadStoredHistory',
+    '\t\t\tconst persistence = ctx.get("sessionPersistence");',
+    '\t\t\tif (persistence === void 0) throw new Error("Codex history persistence unavailable");',
+    '\t\t\tconst stored = await persistence.readFrom(sessionId, 0);',
+    '\t\t\treturn { kind: "detached", header: stored.meta, events: stored.events };',
+    '\t\t}',
+  ].join('\n'),
+));
+
+// A new Codex thread can be opened before the next projector sweep. Its
+// temporary header is served from pending control state, not written by the
+// request path to the projected session log.
+ensure('codexPendingMeta(sessionId)', () => code.replace(
+  '\t\t\tconst stored = await persistence.readFrom(sessionId, 0);\n\t\t\treturn { kind: "detached", header: stored.meta, events: stored.events };',
+  '\t\t\ttry {\n\t\t\t\tconst stored = await persistence.readFrom(sessionId, 0);\n\t\t\t\treturn { kind: "detached", header: stored.meta, events: stored.events };\n\t\t\t} catch (error) {\n\t\t\t\tif (String(error).includes("not found")) {\n\t\t\t\t\tconst pending = codexPendingMeta(sessionId);\n\t\t\t\t\tif (pending) return { kind: "detached", header: pending, events: [] };\n\t\t\t\t}\n\t\t\t\tthrow error;\n\t\t\t}',
+));
+
+// Workspace mutations go to Codex. The installed DSH registry is a read model
+// and must never be a second writer to workspace.json.
+ensure('codexWorkspaceCreate', () => code.replace(
+  '\t\t\tasync create(request) {\n\t\t\t\tconst { path } = request.payload;\n\t\t\t\ttry {',
+  '\t\t\tasync create(request) {\n\t\t\t\tconst { path } = request.payload;\n\t\t\t\tif (' + GUARD + ') { // codexWorkspaceCreate\n\t\t\t\t\tconst result = handleCodexWorkspace("create", { path });\n\t\t\t\t\treturn result.ok ? ok(request, { workspace: result.workspace, created: result.created }) : err(request, { code: "workspace-invalid-path", message: String(result.error), details: { path } });\n\t\t\t\t}\n\t\t\t\ttry {'
+));
+ensure('codexWorkspaceRename', () => code.replace(
+  '\t\t\tasync rename(request) {\n\t\t\t\tconst { payload } = request;\n\t\t\t\tconst workspace = ctx.workspaceRegistry.get(',
+  '\t\t\tasync rename(request) {\n\t\t\t\tconst { payload } = request;\n\t\t\t\tif (' + GUARD + ') { // codexWorkspaceRename\n\t\t\t\t\tconst result = handleCodexWorkspace("rename", payload);\n\t\t\t\t\treturn result.ok ? ok(request, { workspace: result.workspace }) : err(request, { code: "internal", message: String(result.error), details: { workspaceId: payload.workspaceId } });\n\t\t\t\t}\n\t\t\t\tconst workspace = ctx.workspaceRegistry.get('
+));
+ensure('codexWorkspaceDelete', () => code.replace(
+  '\t\t\tasync delete(request) {\n\t\t\t\tconst { workspaceId } = request.payload;\n\t\t\t\tconst operation = workspaceCreationChain',
+  '\t\t\tasync delete(request) {\n\t\t\t\tconst { workspaceId } = request.payload;\n\t\t\t\tif (' + GUARD + ') { // codexWorkspaceDelete\n\t\t\t\t\tconst result = handleCodexWorkspace("delete", { workspaceId });\n\t\t\t\t\treturn result.ok ? ok(request, { deleted: true }) : err(request, { code: "internal", message: String(result.error), details: { workspaceId } });\n\t\t\t\t}\n\t\t\t\tconst operation = workspaceCreationChain'
+));
+ensure('codexWorkspaceMove', () => code.replace(
+  '\t\t\tasync insertBefore(request) {\n\t\t\t\tconst { workspaceId, beforeWorkspaceId } = request.payload;\n\t\t\t\ttry {',
+  '\t\t\tasync insertBefore(request) {\n\t\t\t\tconst { workspaceId, beforeWorkspaceId } = request.payload;\n\t\t\t\tif (' + GUARD + ') { // codexWorkspaceMove\n\t\t\t\t\tconst result = handleCodexWorkspace("insertBefore", { workspaceId, beforeWorkspaceId });\n\t\t\t\t\treturn result.ok ? ok(request, { workspaceIds: result.workspaceIds }) : err(request, { code: "internal", message: String(result.error), details: { workspaceId } });\n\t\t\t\t}\n\t\t\t\ttry {'
+));
+ensure('codexWorkspaceSessionMove', () => code.replace(
+  '\t\t\tasync insertSessionBefore(request) {\n\t\t\t\tconst { payload } = request;\n\t\t\t\tconst workspace = ctx.workspaceRegistry.get(',
+  '\t\t\tasync insertSessionBefore(request) {\n\t\t\t\tconst { payload } = request;\n\t\t\t\tif (' + GUARD + ') { // codexWorkspaceSessionMove\n\t\t\t\t\tconst result = handleCodexWorkspace("insertSessionBefore", payload);\n\t\t\t\t\treturn result.ok ? ok(request, { workspace: result.workspace }) : err(request, { code: "workspace-move-invalid", message: String(result.error), details: { workspaceId: payload.workspaceId, sessionId: payload.sessionId } });\n\t\t\t\t}\n\t\t\t\tconst workspace = ctx.workspaceRegistry.get('
+));
+
+// --- 13. workspace.list reads the projector's file ----------------------
 // The registry caches workspace.json once at boot, so a project Codex deleted
 // kept listing until the host restarted. The projector rewrites the file on
 // every sweep; serving it straight from disk makes the sidebar follow Codex.
@@ -347,12 +418,23 @@ ensure('codexWatchLive(() => {', () => code.replace(
 \t\t\t\t});`));
 
 // Publish project removals as well as updates to already open pages.
-ensure('knownCodexWorkspaceIds = new Set()', () => code.replace(
+ensure('const knownCodexWorkspaceIds = new Set(', () => code.replace(
   '\t\t\t\tif (' + GUARD + ') disposers.push(codexWatchLive(() => {',
   '\t\t\t\tconst knownCodexWorkspaceIds = new Set();\n\t\t\t\tif (' + GUARD + ') disposers.push(codexWatchLive(() => {'));
 ensure('const currentCodexWorkspaceIds = new Set(', () => code.replace(
   '\t\t\t\t\tif (!snapshot) return;\n\t\t\t\t\tfor (const workspace of snapshot.items) queue.push(frame({',
   '\t\t\t\t\tif (!snapshot) return;\n\t\t\t\t\tconst currentCodexWorkspaceIds = new Set(snapshot.items.map((item) => item.workspaceId));\n\t\t\t\t\tfor (const workspaceId of knownCodexWorkspaceIds) if (!currentCodexWorkspaceIds.has(workspaceId)) queue.push(frame({ type: "host/workspace-removed", workspaceId }));\n\t\t\t\t\tknownCodexWorkspaceIds.clear();\n\t\t\t\t\tfor (const workspaceId of currentCodexWorkspaceIds) knownCodexWorkspaceIds.add(workspaceId);\n\t\t\t\t\tfor (const workspace of snapshot.items) queue.push(frame({'));
+
+// The first watcher frame must remove boot-time ghosts and publish Codex order.
+ensure('codexWorkspaceInitialIds', () => code.replace(
+  'const knownCodexWorkspaceIds = new Set();',
+  'const knownCodexWorkspaceIds = new Set(committedWorkspaces.map((workspace) => String(workspace.id))); // codexWorkspaceInitialIds'
+));
+ensure('codexWorkspaceOrderFrame', () => code.replace(
+  /(for \(const workspace of snapshot\.items\) queue\.push\(frame\(\{[\s\S]*?workspace[\s\S]*?\}\)\);)/,
+  '$1' + String.fromCharCode(10) + String.fromCharCode(9).repeat(5) +
+  'queue.push(frame({ type: "host/workspace-order-changed", workspaceIds: snapshot.items.map((item) => item.workspaceId) })); // codexWorkspaceOrderFrame'
+));
 
 // --- 14. client accepts the extra session.list columns ------------------
 {
@@ -390,6 +472,20 @@ ensure('const currentCodexWorkspaceIds = new Set(', () => code.replace(
       console.error('  MISS: client refreshList anchor');
       process.exitCode = 1;
     }
+  }
+}
+
+// The installed runtime is shared with the stock UI; its periodic Codex
+// refresh belongs only to the independent 3080 page. This also upgrades an
+// earlier patch that installed the timer without a port guard.
+{
+  const CR = '/home/nahida/.local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-client-runtime/lib/client.js';
+  let rcode = fs.readFileSync(CR, 'utf-8');
+  const unscoped = 'if (this.codexListTimer === void 0) this.codexListTimer = setInterval(() => {';
+  if (rcode.includes(unscoped)) {
+    rcode = rcode.replace(unscoped, 'if (this.codexListTimer === void 0 && globalThis.location?.port === "3080") this.codexListTimer = setInterval(() => {');
+    fs.writeFileSync(CR, rcode, 'utf-8');
+    console.log('  applied: scope list poll to Codex web edition');
   }
 }
 

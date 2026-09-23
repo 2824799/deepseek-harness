@@ -33,12 +33,21 @@ def persisted(thread_id):
 
 
 def main(argv):
-    cwd = argv[1] if len(argv) > 1 and argv[1] not in ("", "None") else None
+    if len(argv) < 3 or argv[1] != "hold":
+        print("usage: codex_keeper.py hold <workspace-path>", file=sys.stderr)
+        return 2
+    cwd = argv[2] if argv[2] not in ("", "None") else None
     # create_thread closes its connection on return, and the reaper kills a
     # blank thread once its creating connection is gone, so the start call
     # and the hold must share one socket.
-    ws = link.connect(timeout=15)
-    params = {"cwd": cwd or "/home/nahida/agents/sever"}
+    ws = link.connect(timeout=15, experimental=True)
+    cwd = cwd or "/home/nahida/agents/sever"
+    params = {
+        "cwd": cwd,
+        "runtimeWorkspaceRoots": [cwd],
+        "environments": [{"environmentId": "local", "cwd": cwd,
+                          "runtimeWorkspaceRoots": [cwd]}],
+    }
     model = link.default_model()
     if model:
         params["model"] = model

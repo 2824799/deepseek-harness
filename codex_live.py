@@ -1,9 +1,8 @@
 """Live-state bridge between Codex and the DSH web edition.
 
-Two facts the web sidebar needs cannot come from the projected session logs:
-which conversations are running right now, and which workspaces Codex still
-knows about. Both are recomputed here on every sync pass and published as one
-small JSON document the host process reads without touching Codex itself.
+The sidebar needs live Codex facts and a fresh nonblank hint after a thread's
+first turn. These are recomputed on every sync pass and published as one small
+JSON document the host reads without touching Codex itself.
 
 Running detection rides the rollout file: a live turn keeps appending events,
 and every finished turn ends with task_complete or turn_aborted. A rollout
@@ -96,9 +95,18 @@ def scan_projects():
     # every pass would cost a WebSocket handshake per second for a list that
     # changes only when the user adds or removes a project.
     previous = read()
+    if _PROJECTS_FILE[0] != LIVE_FILE:
+        _PROJECTS_FILE[0] = LIVE_FILE
+        _PROJECTS_AT[0] = 0
+        _PROJECT_IDS[0] = {}
     fetched_at = previous.get("projectsAt") or 0
-    if "projects" in previous and previous["projects"] is not None and time.time() * 1000 - fetched_at < 30000:
-        return previous["projects"]
+    now_ms = int(time.time() * 1000)
+    if now_ms - max(fetched_at, _PROJECTS_AT[0]) < 3000:
+        _PROJECT_IDS[0] = previous.get("projectIds") or {}
+        return previous.get("projects")
+    # A failed local app-server request also needs a short backoff; otherwise
+    # each 700 ms sweep repeats the timeout and stalls thread projection.
+    _PROJECTS_AT[0] = now_ms
     try:
         import codex_link as link
         ws = link.connect(timeout=5, experimental=True)
@@ -111,6 +119,7 @@ def scan_projects():
     if not res.get("ok"):
         return None
     projects = {}
+    project_ids = {}
     while True:
         value = res.get("value") or {}
         for entry in value.get("data") or []:
@@ -119,6 +128,7 @@ def scan_projects():
                 path = root.get("path") if isinstance(root, dict) else root
                 if path and name:
                     projects[path] = name
+                    project_ids[path] = entry.get("id")
         cursor = value.get("nextCursor")
         if not cursor:
             break
@@ -132,14 +142,21 @@ def scan_projects():
             return None
         if not res.get("ok"):
             return None
-    _PROJECTS_AT[0] = int(time.time() * 1000)
+    _PROJECT_IDS[0] = project_ids
     return projects
 
 
 _PROJECTS_AT = [0]
+_PROJECTS_FILE = [None]
+_PROJECT_IDS = [{}]
 
 
-def publish(running, projects, titles=None):
+def project_ids():
+    """Codex's project IDs for roots in the most recent project/list page."""
+    return _PROJECT_IDS[0] or read().get("projectIds") or {}
+
+
+def publish(running, projects, titles=None, started_sessions=None):
     """Merge into live-state.json, keeping the last known project map on failure."""
     previous = read()
     if projects is None:
@@ -147,7 +164,10 @@ def publish(running, projects, titles=None):
     values = {
         "running": sorted(running),
         "projects": projects,
+        "projectIds": project_ids(),
         "titles": titles if titles is not None else previous.get("titles") or {},
+        "startedSessions": (sorted(started_sessions) if started_sessions is not None
+                            else previous.get("startedSessions") or []),
         "projectsAt": _PROJECTS_AT[0] or previous.get("projectsAt") or 0,
     }
     if all(previous.get(key) == value for key, value in values.items()):

@@ -1,18 +1,24 @@
-import subprocess
 import time
 
-SETUP = "/home/nahida/agents/sever/dsh/setup_isolated.py"
+import projection_writer
+import setup_isolated
 
-# The projection is incremental and skips unchanged threads, so an idle pass
-# costs about 30 ms. Polling at 700 ms keeps the browser within roughly a
-# second of Codex without measurable load.
+# Keep the rollout byte cursors in one process across sweeps. Spawning a fresh
+# projector each time forced it to parse active 100+ MB rollouts from byte zero.
 INTERVAL_S = 0.7
 
-while True:
-    started = time.time()
-    try:
-        subprocess.run(["python3", SETUP], check=True,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception:
-        pass
-    time.sleep(max(0.0, INTERVAL_S - (time.time() - started)))
+writer = projection_writer.ProjectionWriter()
+try:
+    while True:
+        started = time.monotonic()
+        setup_isolated.run()
+        # Codex deltas arrive through the local socket while the sweep runs.
+        # Only this main thread appends them to the projected session log.
+        for _ in range(128):
+            if not writer.drain():
+                break
+        deadline = started + INTERVAL_S
+        while time.monotonic() < deadline:
+            writer.drain(timeout=max(0.0, min(0.05, deadline - time.monotonic())))
+finally:
+    writer.close()

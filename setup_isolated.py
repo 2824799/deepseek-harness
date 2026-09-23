@@ -20,6 +20,7 @@ import shutil
 import shlex
 import time
 import uuid
+from collections import OrderedDict
 
 import codex_stream
 import codex_live
@@ -29,7 +30,7 @@ HOME = os.path.expanduser("~")
 CODEX_STATE = os.path.join(HOME, ".codex/state_5.sqlite")
 CODEX_HISTORY = os.path.join(HOME, ".codex/thread_history_1.sqlite")
 
-BASE_DIR = "/home/nahida/agents/sever/dsh/.dsh-codex"
+BASE_DIR = os.environ.get("DSH_HOME") or "/home/nahida/agents/sever/dsh/.dsh-codex"
 SESSIONS_ROOT = os.path.join(BASE_DIR, "sessions")
 STORAGES_ROOT = os.path.join(BASE_DIR, "storages")
 STATE_FILE = os.path.join(BASE_DIR, "projection-state.json")
@@ -77,6 +78,22 @@ MODEL_SOURCE = {
 }
 
 NEWLINE = chr(10)
+
+
+def write_json_if_changed(path, value, *, indent=None):
+    """Avoid waking file watchers when a projection snapshot is unchanged."""
+    content = json.dumps(value, ensure_ascii=False, indent=indent)
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            if handle.read() == content:
+                return False
+    except OSError:
+        pass
+    temporary = path + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as handle:
+        handle.write(content)
+    os.replace(temporary, path)
+    return True
 
 
 def build_rollout_index():
@@ -161,7 +178,92 @@ def _completed_item(record):
             payload.get("turn_id"))
 
 
-def read_rollout_meta(rollout_path, rollout_index=None, after_ordinal=-1):
+_ROLLOUT_META_CACHE = OrderedDict()
+_ROLLOUT_META_CACHE_LIMIT = 16
+
+
+def _rollout_meta_file(candidate, after_ordinal, incremental):
+    """Fold only complete new JSONL records when this process has a cursor."""
+    stat = os.stat(candidate)
+    with open(candidate, "rb") as handle:
+        prefix = handle.read(256)
+        cached = _ROLLOUT_META_CACHE.get(candidate) if incremental else None
+        valid = (cached is not None
+                 and cached["identity"] == (stat.st_dev, stat.st_ino, prefix)
+                 and cached["offset"] <= stat.st_size
+                 and cached["floor"] <= after_ordinal
+                 and (cached["size"] != stat.st_size
+                      or cached["mtime_ns"] == stat.st_mtime_ns))
+        if valid:
+            state = cached
+            if after_ordinal > state["floor"]:
+                state["recovered"] = [item for item in state["recovered"]
+                                      if item[2] > after_ordinal]
+                state["floor"] = after_ordinal
+        else:
+            state = {"identity": (stat.st_dev, stat.st_ino, prefix),
+                     "offset": 0, "size": 0, "mtime_ns": 0,
+                     "floor": after_ordinal, "timings": {}, "usage": [],
+                     "recovered": [], "tool_ms": {}, "item_turns": {}}
+        handle.seek(state["offset"])
+        while True:
+            line = handle.readline()
+            if not line or not line.endswith(b"\n"):
+                # Do not advance past a half-written record. The next sweep
+                # will parse it once its newline has arrived.
+                break
+            state["offset"] = handle.tell()
+            try:
+                record = json.loads(line)
+            except (ValueError, UnicodeDecodeError):
+                continue
+            payload = record.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            kind = payload.get("type")
+            turn_id = payload.get("turn_id")
+            ordinal = record.get("ordinal")
+            if kind == "item_completed" and isinstance(ordinal, int) and turn_id:
+                state["item_turns"][ordinal] = turn_id
+            if (record.get("type") == "event_msg" and kind == "item_completed"
+                    and isinstance(ordinal, int) and ordinal > state["floor"]):
+                converted = _completed_item(record)
+                if converted is not None:
+                    state["recovered"].append(converted)
+            if kind == "task_complete" and turn_id:
+                started = payload.get("started_at")
+                state["timings"][turn_id] = {
+                    "startMs": int(started) * 1000 if started else None,
+                    "durationMs": payload.get("duration_ms"),
+                    "ttftMs": payload.get("time_to_first_token_ms"),
+                }
+            elif record.get("type") == "token_usage_record":
+                ordinal = record.get("ordinal")
+                usage = payload.get("usage")
+                if isinstance(ordinal, int) and isinstance(usage, dict):
+                    state["usage"].append((ordinal, usage))
+            elif kind == "item_completed":
+                item = payload.get("item")
+                if isinstance(item, dict) and item.get("type") in (
+                        "CommandExecution", "McpToolCall", "FileChange",
+                        "DynamicToolCall", "WebSearch", "CollabAgentToolCall") and turn_id:
+                    started_ms = payload.get("started_at_ms")
+                    completed_ms = payload.get("completed_at_ms")
+                    if started_ms and completed_ms and completed_ms > started_ms:
+                        tool_ms = state["tool_ms"]
+                        tool_ms[turn_id] = tool_ms.get(turn_id, 0) + (completed_ms - started_ms)
+    state["size"] = stat.st_size
+    state["mtime_ns"] = stat.st_mtime_ns
+    if incremental:
+        _ROLLOUT_META_CACHE[candidate] = state
+        _ROLLOUT_META_CACHE.move_to_end(candidate)
+        while len(_ROLLOUT_META_CACHE) > _ROLLOUT_META_CACHE_LIMIT:
+            _ROLLOUT_META_CACHE.popitem(last=False)
+    return state
+
+
+def read_rollout_meta(rollout_path, rollout_index=None, after_ordinal=-1, *,
+                      incremental=False, include_item_turns=False):
     """Per-turn timing and per-ordinal usage recorded by Codex.
 
     Codex writes first-token latency and turn duration to the rollout rather
@@ -172,6 +274,7 @@ def read_rollout_meta(rollout_path, rollout_index=None, after_ordinal=-1):
     usage_records = []
     recovered = []
     tool_ms = {}
+    item_turns = {}
     # Codex rotates a thread's rollout on compaction, so a thread's earlier
     # turns live in sibling files beside the current one. Read them all, or
     # the earlier turns report no usage.
@@ -188,60 +291,20 @@ def read_rollout_meta(rollout_path, rollout_index=None, after_ordinal=-1):
         if not os.path.exists(candidate):
             continue
         try:
-            with open(candidate, "r", encoding="utf-8", errors="replace") as handle:
-                for line in handle:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        record = json.loads(line)
-                    except Exception:
-                        continue
-                    payload = record.get("payload")
-                    if not isinstance(payload, dict):
-                        continue
-                    kind = payload.get("type")
-                    turn_id = payload.get("turn_id")
-                    if (record.get("type") == "event_msg" and kind == "item_completed"
-                            and isinstance(record.get("ordinal"), int)
-                            and record["ordinal"] > after_ordinal):
-                        converted = _completed_item(record)
-                        if converted is not None:
-                            recovered.append(converted)
-                    if kind == "task_complete" and turn_id:
-                        started = payload.get("started_at")
-                        timings[turn_id] = {
-                            "startMs": int(started) * 1000 if started else None,
-                            "durationMs": payload.get("duration_ms"),
-                            "ttftMs": payload.get("time_to_first_token_ms"),
-                        }
-                    elif record.get("type") == "token_usage_record":
-                        # One record per model request, each landing on its own
-                        # rollout line with no matching thread_item. They are
-                        # collected with their ordinal and attributed to the
-                        # item that preceded them, so every request is counted
-                        # exactly once.
-                        ordinal = record.get("ordinal")
-                        usage = payload.get("usage")
-                        if isinstance(ordinal, int) and isinstance(usage, dict):
-                            usage_records.append((ordinal, usage))
-                    elif kind == "item_completed":
-                        # Codex reports whole-turn wall time, which includes
-                        # tool execution. The footer shows tool time on its own
-                        # line, so the model time this feeds is the turn's
-                        # duration minus its tool calls.
-                        item = payload.get("item")
-                        if isinstance(item, dict) and item.get("type") in (
-                                "CommandExecution", "McpToolCall", "FileChange",
-                                "DynamicToolCall", "WebSearch", "CollabAgentToolCall") and turn_id:
-                            started_ms = payload.get("started_at_ms")
-                            completed_ms = payload.get("completed_at_ms")
-                            if started_ms and completed_ms and completed_ms > started_ms:
-                                tool_ms[turn_id] = tool_ms.get(turn_id, 0) + (completed_ms - started_ms)
+            state = _rollout_meta_file(candidate, after_ordinal, incremental)
+            timings.update(state["timings"])
+            usage_records.extend(state["usage"])
+            recovered.extend(item for item in state["recovered"] if item[2] > after_ordinal)
+            if include_item_turns:
+                item_turns.update(state["item_turns"])
+            for turn, ms in state["tool_ms"].items():
+                tool_ms[turn] = tool_ms.get(turn, 0) + ms
         except Exception:
             continue
     for turn, ms in tool_ms.items():
         timings.setdefault(turn, {})["toolMs"] = ms
+    if include_item_turns:
+        return timings, usage_records, recovered, item_turns
     return timings, usage_records, recovered
 
 
@@ -650,8 +713,9 @@ def run():
     # Every thread id that still exists in Codex, archived or not. Session
     # directories outside this set belong to threads Codex has deleted and
     # must not keep listing on the web.
-    state_cur.execute("SELECT id FROM threads")
-    known_thread_ids = {row[0] for row in state_cur.fetchall()}
+    state_cur.execute("SELECT id, cwd FROM threads")
+    known_threads = dict(state_cur.fetchall())
+    known_thread_ids = set(known_threads)
     pending_threads = codex_pending.load()
     active_pending = codex_pending.prune(pending_threads, known_thread_ids)
     if active_pending != pending_threads:
@@ -659,6 +723,8 @@ def run():
     pending_threads = active_pending
     known_session_ids = {"session-" + thread_id for thread_id in known_thread_ids}
     known_session_ids.update("session-" + thread_id for thread_id in pending_threads)
+    for thread_id, entry in pending_threads.items():
+        codex_pending.materialize(thread_id, entry)
     state_conn.close()
 
     hist_conn = sqlite3.connect(CODEX_HISTORY)
@@ -670,11 +736,9 @@ def run():
     hist_cur.execute("SELECT thread_id, MAX(rollout_ordinal), COUNT(*) FROM thread_items GROUP BY thread_id")
     item_marks = {row[0]: (row[1], row[2]) for row in hist_cur.fetchall()}
 
-    # Codex owns the project list; the app-server's project/list is the only
-    # source that sees creations and deletions. threads.project_id is NULL for
-    # every row, so membership is decided by matching the thread cwd against
-    # the published project roots. A thread whose cwd no longer belongs to any
-    # project lists ungrouped, exactly where Codex Desktop shows it.
+    # The app-server's project/list owns both the project list and its order.
+    # Project membership comes from threads.project_id when assigned, with cwd
+    # fallback for older Codex threads that have no explicit project ID.
     live_projects = codex_live.scan_projects()
     live_doc = codex_live.read()
     if live_projects is None:
@@ -683,36 +747,31 @@ def run():
     # keep workspace.json byte-identical across idle sweeps, which is what
     # lets the host's file watcher stay quiet.
     previous_ws_entries = {}
-    previous_seen_paths = set()
     try:
         with open(os.path.join(STORAGES_ROOT, "workspace.json"), "r", encoding="utf-8") as handle:
             previous_workspaces = json.load(handle)
         previous_ws_entries = previous_workspaces.get("tables", {}).get("workspaces") or {}
-        previous_seen_paths = set((previous_workspaces.get("global") or {}).get("projectsSeen") or [])
     except Exception:
         pass
     group_roots = dict(live_projects)
-    web_workspace_ids = {}
-    for workspace_id, entry in previous_ws_entries.items():
-        path = entry.get("path")
-        if (entry.get("webAdded") and path and path not in live_projects
-                and path not in previous_seen_paths and os.path.isdir(path)):
-            group_roots.setdefault(path, entry.get("title") or os.path.basename(path))
-            web_workspace_ids[path] = workspace_id
-    groups = {}
+    previous_ids_by_path = {entry.get("path"): workspace_id
+                            for workspace_id, entry in previous_ws_entries.items()
+                            if entry.get("path") in group_roots}
+    project_root_by_id = {project_id: root for root, project_id in codex_live.project_ids().items()
+                          if project_id and root in group_roots}
+    groups = {root: {"title": name, "path": root, "threads": []}
+              for root, name in group_roots.items()}
     loose = []
     for th in threads:
         th_id, title, name, created_at, updated_at, cwd, project_id, rollout_path = th
         if not cwd:
             cwd = "/home/nahida/agents/sever"
-        proj_name = group_roots.get(cwd)
+        group_path = project_root_by_id.get(project_id, cwd)
+        proj_name = group_roots.get(group_path)
         if proj_name is None:
             loose.append(th)
             continue
-        # Paths, unlike display names, identify a project root. Two projects
-        # may share a name and must keep their own conversations.
-        groups.setdefault(cwd, {"title": proj_name, "path": cwd, "threads": []})
-        groups[cwd]["threads"].append(th)
+        groups[group_path]["threads"].append(th)
 
     workspace_table = {}
     workspace_ids = []
@@ -731,7 +790,8 @@ def run():
         derived_slugs.add(ws_slug)
         ws_dir = os.path.join(SESSIONS_ROOT, ws_slug)
         os.makedirs(ws_dir, exist_ok=True)
-        ws_id = web_workspace_ids.get(cwd) or str(uuid.uuid5(uuid.NAMESPACE_URL, proj_name + (cwd or "")))
+        ws_id = previous_ids_by_path.get(cwd) or str(uuid.uuid5(
+            uuid.NAMESPACE_URL, cwd or "/home/nahida/agents/sever"))
         # Session headers and projection identities carry a cwd the storage
         # layer requires to be a string; the loose bucket has no directory of
         # its own, so its sessions borrow the fallback root.
@@ -770,9 +830,9 @@ def run():
             # Skip a thread that cannot have produced new events. Its session
             # file and cache row already exist, so nothing else in this pass
             # would change either.
-            if (st is not None and os.path.exists(jsonl_file) and mark is not None
+            if (st is not None and os.path.exists(jsonl_file)
                     and st.get("version") == PROJECTION_VERSION
-                    and st.get("mark") == list(mark)
+                    and st.get("mark") == (list(mark) if mark is not None else None)
                     and st.get("rolloutMtime") == rollout_mtime
                     and st.get("label") == label
                     # A permission switch changes nothing Codex records in the
@@ -793,8 +853,13 @@ def run():
             """, (th_id,))
             items = hist_cur.fetchall()
             history_max = max((it[2] for it in items if isinstance(it[2], int)), default=-1)
-            timings, usage_records, recovered = read_rollout_meta(
-                rollout_path, rollout_index, history_max)
+            recovery_floor = history_max
+            if (st is not None and os.path.exists(jsonl_file)
+                    and st.get("version") == PROJECTION_VERSION):
+                recovery_floor = max(history_max, st.get("last_ordinal", -1))
+            timings, usage_records, recovered, rollout_item_turns = read_rollout_meta(
+                rollout_path, rollout_index, recovery_floor,
+                incremental=True, include_item_turns=True)
             if recovered:
                 # Desktop can keep writing its rollout after its history index
                 # stops updating. The rollout's completed items are the source
@@ -819,7 +884,9 @@ def run():
             }
 
             usage_by_turn = attribute_usage(
-                {it[2]: it[5] for it in items if it[5]}, usage_records)
+                {**rollout_item_turns,
+                 **{it[2]: it[5] for it in items if it[5] and isinstance(it[2], int)}},
+                usage_records)
 
             # The turn's last assistant message carries its first-token and
             # decode timing, because that is the step the footer measures.
@@ -1123,13 +1190,38 @@ def run():
         if proj_name:
             workspace_table[ws_id] = {
                 "path": cwd, "title": proj_name, "sessionIds": sess_ids,
-                **({"webAdded": True} if ws_id in web_workspace_ids.values() else {}),
                 "createdAt": (previous_ws_entries.get(ws_id) or {}).get("createdAt") or now_iso,
                 "updatedAt": now_iso if (
                     (previous_ws_entries.get(ws_id) or {}).get("sessionIds") != sess_ids
                     or (previous_ws_entries.get(ws_id) or {}).get("title") != proj_name
                 ) else (previous_ws_entries.get(ws_id) or {}).get("updatedAt") or now_iso,
             }
+
+    # A thread can change project roots while both the old and new roots still
+    # exist. The ungrouped bucket uses the fallback root, even when Codex's cwd
+    # is elsewhere. Retain displaced copies outside the scanned sessions tree.
+    displaced_root = os.path.join(BASE_DIR, "displaced-projections")
+    slugs = [slug for slug in os.listdir(SESSIONS_ROOT)
+             if os.path.isdir(os.path.join(SESSIONS_ROOT, slug))]
+    for thread_id, thread_cwd in known_threads.items():
+        owner_cwd = thread_cwd if thread_cwd in group_roots else "/home/nahida/agents/sever"
+        expected_slug = "--" + owner_cwd.strip("/").replace("/", "-") + "--"
+        session_name = "session-" + thread_id
+        canonical = os.path.join(SESSIONS_ROOT, expected_slug, session_name, "session.jsonl")
+        candidates = [slug for slug in slugs
+                      if os.path.isfile(os.path.join(SESSIONS_ROOT, slug, session_name, "session.jsonl"))]
+        if len(candidates) < 2:
+            continue
+        keeper = expected_slug if os.path.isfile(canonical) else max(
+            candidates, key=lambda slug: os.path.getsize(os.path.join(
+                SESSIONS_ROOT, slug, session_name, "session.jsonl")))
+        for slug in candidates:
+            if slug == keeper:
+                continue
+            displaced = os.path.join(SESSIONS_ROOT, slug, session_name)
+            target = os.path.join(displaced_root, slug, session_name + "-" + str(time.time_ns()))
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            shutil.move(displaced, target)
 
     # Session directories of threads Codex no longer knows about would keep
     # listing forever otherwise: persistence.list() walks every directory under
@@ -1147,56 +1239,11 @@ def run():
 
     hist_conn.close()
 
-    # A workspace the user added from the web has no Codex thread behind it, so
-    # this pass derives nothing for it. The existing file is read back and those
-    # entries are carried over; writing only the derived set would drop them on
-    # the next sweep and the restart after that would lose them for good.
     workspace_file = os.path.join(STORAGES_ROOT, "workspace.json")
-    carried_ids = []
-    carried = {}
-    seen_paths = set()
-    try:
-        with open(workspace_file, "r", encoding="utf-8") as handle:
-            previous = json.load(handle)
-        previous_global = previous.get("global") or {}
-        seen_paths = set(previous_global.get("projectsSeen") or [])
-        has_seen = "projectsSeen" in previous_global
-        derived_paths = {entry["path"] for entry in workspace_table.values()}
-        for ws_id, entry in (previous.get("tables", {}).get("workspaces") or {}).items():
-            path = entry.get("path") or ""
-            if path in derived_paths:
-                continue
-            if path in seen_paths and path not in live_projects:
-                continue
-            # A row Codex owns must die with its project; only rows the web
-            # added by hand survive. projectsSeen records every path that was
-            # ever a Codex project root, so a path that left the project list
-            # is a deletion, while a path Codex never owned is hand-added.
-            # Before the first seen-set exists, a live directory is the only
-            # evidence available, which is what the migration run uses.
-            if not entry.get("webAdded"):
-                if has_seen:
-                    keep = path not in seen_paths and os.path.isdir(path)
-                else:
-                    keep = os.path.isdir(path)
-                if not keep:
-                    continue
-                entry = {**entry, "webAdded": True}
-            carried[ws_id] = entry
-            carried_ids.append(ws_id)
-    except Exception:
-        pass
-
-    # Whole workspace slugs Codex no longer derives (a deleted project, or a
-    # grouping that moved to the ungrouped bucket) keep their session folders
-    # on disk, and persistence.list() walks every folder under the sessions
-    # root. Dropping the slug drops the ghost listing; the threads it held are
-    # re-projected into their new bucket on the next pass because their new
-    # session file does not exist yet. Slugs of hand-added workspaces stay:
-    # their sessions live only there.
+    # The previous registry supplies stable IDs and timestamps only. A project
+    # absent from Codex's latest list cannot survive by virtue of an old DSH
+    # row. Prune its folder so the DSH persistence scanner cannot show ghosts.
     keep_slugs = set(derived_slugs)
-    for entry in carried.values():
-        keep_slugs.add("--" + (entry.get("path") or "").strip("/").replace("/", "-") + "--")
     for slug in os.listdir(SESSIONS_ROOT):
         if slug in keep_slugs:
             continue
@@ -1204,25 +1251,21 @@ def run():
         if os.path.isdir(slug_dir):
             shutil.rmtree(slug_dir, ignore_errors=True)
 
-    with open(workspace_file, "w", encoding="utf-8") as handle:
-        json.dump({
+    write_json_if_changed(workspace_file, {
             "unit": {"name": "workspace", "version": 2},
             "global": {"initialized": True,
-                       "workspaceIds": workspace_ids + carried_ids,
-                       "archivedSessionIds": archived_session_ids,
-                       "projectsSeen": sorted(seen_paths | set(live_projects))},
-            "tables": {"workspaces": {**workspace_table, **carried}},
-        }, handle, ensure_ascii=False, indent=2)
+                       "workspaceIds": workspace_ids,
+                       "archivedSessionIds": archived_session_ids},
+            "tables": {"workspaces": workspace_table},
+        }, indent=2)
 
-    with open(os.path.join(STORAGES_ROOT, "session_projcache.json"), "w", encoding="utf-8") as handle:
-        json.dump({
+    write_json_if_changed(os.path.join(STORAGES_ROOT, "session_projcache.json"), {
             "unit": {"name": "session_projcache", "version": 3},
             "global": None,
             "tables": {"sessions": proj_cache_sessions},
-        }, handle, ensure_ascii=False, indent=2)
+        }, indent=2)
 
-    with open(STATE_FILE, "w", encoding="utf-8") as handle:
-        json.dump(states, handle, ensure_ascii=False)
+    write_json_if_changed(STATE_FILE, states)
 
     # A blank thread exists only in the app-server until its first turn.
     # Keep its header and workspace membership through every projection pass;
@@ -1235,7 +1278,8 @@ def run():
 
     # One small document the host process reads to answer "which conversations
     # are running" and "what is this session called" without touching Codex.
-    codex_live.publish(codex_live.scan_running(), live_projects, titles)
+    codex_live.publish(codex_live.scan_running(), live_projects, titles,
+                       proj_cache_sessions.keys())
 
     fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
     lock_fh.close()

@@ -5,6 +5,7 @@ import sqlite3
 from unittest import mock
 
 import codex_link
+import codex_keeper
 import codex_live
 import codex_pending
 import setup_isolated
@@ -23,14 +24,32 @@ class FakeSocket:
         pass
 
 
+def test_blank_thread_keeper_starts_in_selected_workspace(capsys):
+    ws = FakeSocket({"thread/start": {"ok": True, "value": {
+        "thread": {"id": "thread-1"}}}})
+    with (mock.patch.object(codex_keeper.link, "connect", return_value=ws) as connect,
+          mock.patch.object(codex_keeper.link, "default_model", return_value=None),
+          mock.patch.object(codex_keeper, "persisted", return_value=True)):
+        assert codex_keeper.main(["codex_keeper.py", "hold", "/project/selected"]) == 0
+    assert capsys.readouterr().out.strip() == "thread-1"
+    connect.assert_called_once_with(timeout=15, experimental=True)
+    params = ws.calls[0][1]
+    assert params["cwd"] == "/project/selected"
+    assert params["runtimeWorkspaceRoots"] == ["/project/selected"]
+    assert params["environments"][0]["cwd"] == "/project/selected"
+
+
 def test_blank_thread_registration_uses_selected_workspace(tmp_path):
     with (mock.patch.object(codex_pending, "BASE_DIR", str(tmp_path)),
           mock.patch.object(codex_pending, "FILE", str(tmp_path / "pending-threads.json")),
           mock.patch.object(codex_pending, "LOCK", str(tmp_path / "projection.lock"))):
         codex_pending.register("thread-1", "workspace-1", "/project/selected")
         entry = codex_pending.load()["thread-1"]
-        header = json.loads((tmp_path / "sessions" / "--project-selected--"
-                             / "session-thread-1" / "session.jsonl").read_text())
+        log = (tmp_path / "sessions" / "--project-selected--"
+               / "session-thread-1" / "session.jsonl")
+        assert not log.exists()
+        codex_pending.materialize("thread-1", entry)
+        header = json.loads(log.read_text())
     assert entry["workspaceId"] == "workspace-1"
     assert entry["cwd"] == "/project/selected"
     assert header["id"] == "session-thread-1"
@@ -82,6 +101,15 @@ def test_empty_project_list_replaces_previous_snapshot(tmp_path):
     assert result["projects"] == {}
 
 
+def test_projected_first_turn_publishes_nonblank_list_hint(tmp_path):
+    live_file = tmp_path / "live-state.json"
+    with mock.patch.object(codex_live, "LIVE_FILE", str(live_file)):
+        result = codex_live.publish({}, {}, {}, ["session-first-turn"])
+        assert result["startedSessions"] == ["session-first-turn"]
+        assert codex_live.publish({}, {}, {})["startedSessions"] == ["session-first-turn"]
+        assert codex_live.publish({}, {}, {}, [])["startedSessions"] == []
+
+
 def test_project_list_reads_all_pages(tmp_path):
     replies = iter([
         {"ok": True, "value": {"data": [{"name": "one", "roots": [{"path": "/one"}]}], "nextCursor": "next"}},
@@ -97,6 +125,14 @@ def test_project_list_reads_all_pages(tmp_path):
     with (mock.patch.object(codex_live, "LIVE_FILE", str(tmp_path / "missing.json")),
           mock.patch.object(codex_link, "connect", side_effect=[PagedSocket(), PagedSocket()])):
         assert codex_live.scan_projects() == {"/one": "one", "/two": "two"}
+
+
+def test_project_list_failure_does_not_block_every_sync_sweep(tmp_path):
+    with (mock.patch.object(codex_live, "LIVE_FILE", str(tmp_path / "missing.json")),
+          mock.patch.object(codex_link, "connect", side_effect=ConnectionError("offline")) as connect):
+        assert codex_live.scan_projects() is None
+        assert codex_live.scan_projects() is None
+        assert connect.call_count == 1
 
 
 def test_archive_fallback_rejects_missing_thread(tmp_path):

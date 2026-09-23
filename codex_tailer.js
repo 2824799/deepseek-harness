@@ -101,7 +101,7 @@ export function startCodexTailer(pushFrame, signal, options = {}) {
       fd = fs.openSync(file, "r");
       const buffer = Buffer.allocUnsafe(length);
       const read = fs.readSync(fd, buffer, 0, length, offset);
-      return buffer.subarray(0, read).toString("utf-8");
+      return buffer.subarray(0, read);
     } catch {
       return null;
     } finally {
@@ -115,24 +115,25 @@ export function startCodexTailer(pushFrame, signal, options = {}) {
     }
   };
 
-  const parseLines = (text, offset) => {
+  // File offsets are bytes, not JavaScript string positions: UTF-8 characters
+  // can occupy several bytes, especially in Chinese conversations.
+  const parseLines = (bytes, offset) => {
     const events = [];
     let start = 0;
     let consumed = offset;
-    let index = text.indexOf("\n");
+    let index = bytes.indexOf(10);
     while (index !== -1) {
-      const line = text.slice(start, index).trim();
+      const line = bytes.subarray(start, index).toString("utf-8").trim();
       consumed += index + 1 - start;
       start = index + 1;
       if (line) {
         try {
           events.push(JSON.parse(line));
         } catch {
-          // A torn or unreadable line is skipped; the next scan re-reads from
-          // the last complete line, so nothing is lost permanently.
+          // A complete but malformed record cannot be delivered as an event.
         }
       }
-      index = text.indexOf("\n", start);
+      index = bytes.indexOf(10, start);
     }
     // The offset stops at the last complete line, so a half-written line is
     // re-read (and completed) by the next scan instead of being lost.

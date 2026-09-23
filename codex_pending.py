@@ -6,7 +6,7 @@ import os
 import sys
 import time
 
-BASE_DIR = "/home/nahida/agents/sever/dsh/.dsh-codex"
+BASE_DIR = os.environ.get("DSH_HOME") or "/home/nahida/agents/sever/dsh/.dsh-codex"
 FILE = os.path.join(BASE_DIR, "pending-threads.json")
 LOCK = os.path.join(BASE_DIR, "projection.lock")
 MAX_BLANK_AGE_S = 1860
@@ -42,6 +42,7 @@ def session_file(thread_id, cwd):
 
 
 def register(thread_id, workspace_id, cwd):
+    """Record the Codex thread identity; the sync daemon owns its log."""
     os.makedirs(BASE_DIR, exist_ok=True)
     with open(LOCK, "a", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
@@ -50,16 +51,21 @@ def register(thread_id, workspace_id, cwd):
         entries[thread_id] = {
             "workspaceId": workspace_id, "cwd": cwd, "createdAt": created,
         }
-        target = session_file(thread_id, cwd)
-        os.makedirs(os.path.dirname(target), exist_ok=True)
-        if not os.path.exists(target):
-            with open(target, "x", encoding="utf-8") as handle:
-                handle.write(json.dumps({
-                    "type": "session", "version": 0, "id": "session-" + thread_id,
-                    "createdAt": int(created * 1000), "cwd": cwd,
-                    "delegationDepth": 0, "agentPreset": "standard",
-                }, ensure_ascii=False) + "\n")
         save(entries)
+
+
+def materialize(thread_id, entry):
+    """Create a blank projection only from the sync daemon's locked sweep."""
+    cwd = entry["cwd"]
+    target = session_file(thread_id, cwd)
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    if not os.path.exists(target):
+        with open(target, "x", encoding="utf-8") as handle:
+            handle.write(json.dumps({
+                "type": "session", "version": 0, "id": "session-" + thread_id,
+                "createdAt": int(entry["createdAt"] * 1000), "cwd": cwd,
+                "delegationDepth": 0, "agentPreset": "standard",
+            }, ensure_ascii=False) + "\n")
 
 
 if __name__ == "__main__":

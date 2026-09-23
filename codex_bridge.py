@@ -16,27 +16,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import codex_link  # noqa: E402
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-
-
 def extract_thread_id(session_id):
     if session_id.startswith("session-"):
         return session_id[8:]
     return session_id
-
-
-def refresh_sessions():
-    """Best-effort re-projection so the web sidebar reflects the new state."""
-    try:
-        import subprocess
-
-        subprocess.run(
-            ["python3", os.path.join(HERE, "setup_isolated.py")],
-            capture_output=True,
-            timeout=30,
-        )
-    except Exception:
-        pass
 
 
 def send_prompt(session_id, payload):
@@ -51,41 +34,26 @@ def send_prompt(session_id, payload):
         if len(parts) < 2:
             return {"ok": False, "error": "usage: /permission <preset>"}
         return set_permission(session_id, parts[1])
-    result = codex_link.send_prompt(thread_id, payload)
-    if result.get("ok"):
-        refresh_sessions()
-    return result
+    return codex_link.send_prompt(thread_id, payload)
 
 
 def archive_session(session_id):
     thread_id = extract_thread_id(session_id)
-    result = codex_link.set_archived(thread_id, True)
-    if result.get("ok"):
-        refresh_sessions()
-    return result
+    return codex_link.set_archived(thread_id, True)
 
 
 def rename_session(session_id, new_title):
     thread_id = extract_thread_id(session_id)
-    result = codex_link.rename_thread(thread_id, new_title.strip())
-    if result.get("ok"):
-        refresh_sessions()
-    return result
+    return codex_link.rename_thread(thread_id, new_title.strip())
 
 
 def create_session(workspace_path=None):
-    result = codex_link.create_thread({"cwd": workspace_path or "/home/nahida/agents/sever"})
-    if result.get("ok"):
-        refresh_sessions()
-    return result
+    return codex_link.create_thread({"cwd": workspace_path or "/home/nahida/agents/sever"})
 
 
 def fork_session(session_id):
     thread_id = extract_thread_id(session_id)
-    result = codex_link.fork_thread(thread_id)
-    if result.get("ok"):
-        refresh_sessions()
-    return result
+    return codex_link.fork_thread(thread_id)
 
 
 def cancel_session(session_id):

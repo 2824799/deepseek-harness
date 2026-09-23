@@ -426,7 +426,7 @@ def send_prompt(thread_id, payload):
     # The permission picker writes to its own file, so it is merged in beside
     # the model choice rather than replacing it: a turn carries both.
     model_override.update(permission_override(thread_id))
-    ws = connect()
+    ws = connect(experimental=True)
     try:
         # Attach to the thread first: turn/start needs a loaded thread, and a
         # resume failure tells us whether Desktop already owns this writer.
@@ -473,6 +473,15 @@ def send_prompt(thread_id, payload):
                 return {"ok": False, "error": "Codex Desktop owns this turn; steering is unavailable from the web app-server"}
             return {"ok": False, "error": json.dumps(res["error"])}
         params = {"threadId": thread_id, "input": items}
+        # Blank threads are absent from the durable Workspace registry until
+        # their first turn. Carry the picked cwd into that first turn so Codex
+        # does not persist the app-server's fallback working directory.
+        picked_cwd = pending_thread_cwd(thread_id)
+        if picked_cwd:
+            params["cwd"] = picked_cwd
+            params["runtimeWorkspaceRoots"] = [picked_cwd]
+            params["environments"] = [{"environmentId": "local", "cwd": picked_cwd,
+                                        "runtimeWorkspaceRoots": [picked_cwd]}]
         params.update(model_override)
         res = ws.call("turn/start", params, timeout=25)
         if res["ok"]:
@@ -543,11 +552,16 @@ def queue_prompt(thread_id, items, reason=None, image_paths=None):
 
 def create_thread(payload):
     cwd = payload.get("cwd") or "/home/nahida/agents/sever"
-    params = {"cwd": cwd}
+    params = {
+        "cwd": cwd,
+        "runtimeWorkspaceRoots": [cwd],
+        "environments": [{"environmentId": "local", "cwd": cwd,
+                          "runtimeWorkspaceRoots": [cwd]}],
+    }
     model = payload.get("model") or default_model()
     if model:
         params["model"] = model
-    ws = connect()
+    ws = connect(experimental=True)
     try:
         res = ws.call("thread/start", params, timeout=25)
         if not res["ok"]:
@@ -565,6 +579,9 @@ def create_thread(payload):
 
 def thread_cwd(thread_id):
     """The working directory a projected session belongs to, from the registry."""
+    picked = pending_thread_cwd(thread_id)
+    if picked:
+        return picked
     session_id = thread_id if thread_id.startswith("session-") else "session-" + thread_id
     try:
         with open(os.path.join(os.path.dirname(SELECTION_FILE), "storages", "workspace.json"),
@@ -576,6 +593,17 @@ def thread_cwd(thread_id):
         if session_id in (entry.get("sessionIds") or []):
             return entry.get("path")
     return None
+
+
+def pending_thread_cwd(thread_id):
+    """The selected Workspace of a blank web thread awaiting its first turn."""
+    try:
+        with open(os.path.join(os.path.dirname(SELECTION_FILE), "pending-threads.json"),
+                  encoding="utf-8") as handle:
+            entry = json.load(handle).get(thread_id) or {}
+        return entry.get("cwd")
+    except (OSError, ValueError):
+        return None
 
 
 def rename_thread(thread_id, title):
