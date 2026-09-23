@@ -7,6 +7,12 @@ const KEEPER = "/home/nahida/agents/sever/dsh/codex_keeper.py";
 
 const LIVE_FILE = path.join(process.env.DSH_HOME || "/home/nahida/agents/sever/dsh/.dsh-codex", "live-state.json");
 const WORKSPACE_FILE = path.join(process.env.DSH_HOME || "/home/nahida/agents/sever/dsh/.dsh-codex", "storages", "workspace.json");
+const PENDING_FILE = path.join(process.env.DSH_HOME || "/home/nahida/agents/sever/dsh/.dsh-codex", "pending-threads.json");
+
+function pendingThreads() {
+  try { return JSON.parse(fs.readFileSync(PENDING_FILE, "utf-8")); }
+  catch { return {}; }
+}
 
 let liveCache = { mtime: 0, doc: {} };
 
@@ -59,6 +65,13 @@ export function codexWorkspaceSnapshot() {
         updatedAt: entry.updatedAt
       });
     }
+    for (const [threadId, pending] of Object.entries(pendingThreads())) {
+      const owner = items.find(item => item.workspaceId === pending.workspaceId);
+      if (owner && owner.path === pending.cwd) {
+        const sessionId = "session-" + threadId;
+        if (!owner.sessionIds.includes(sessionId)) owner.sessionIds.push(sessionId);
+      }
+    }
     return { items, archivedSessionIds: (doc.global || {}).archivedSessionIds || [] };
   } catch {
     return null;
@@ -73,7 +86,7 @@ export function codexWatchLive(onChange) {
   const seen = { live: "", workspace: "" };
   const check = () => {
     let changed = false;
-    for (const [key, file] of [["live", LIVE_FILE], ["workspace", WORKSPACE_FILE]]) {
+    for (const [key, file] of [["live", LIVE_FILE], ["workspace", WORKSPACE_FILE], ["pending", PENDING_FILE]]) {
       let content = "";
       try {
         content = fs.readFileSync(file, "utf-8");
@@ -171,7 +184,7 @@ export function handleCodexRename(sessionId, title) {
   }
 }
 
-export function handleCodexCreate(workspacePath) {
+export function handleCodexCreate(workspacePath, workspaceId) {
   // A blank Codex thread is reaped about a minute after its creating
   // connection closes, so creation runs in a detached holder process that
   // keeps that connection open until the first message persists the thread.
@@ -201,6 +214,12 @@ export function handleCodexCreate(workspacePath) {
         } catch {
           return { ok: false, error: line };
         }
+      }
+      if (workspaceId) {
+        const registered = cp.spawnSync("python3", [
+          "/home/nahida/agents/sever/dsh/codex_pending.py", line, workspaceId, workspacePath
+        ], { encoding: "utf-8" });
+        if (registered.status !== 0) return { ok: false, error: registered.stderr || "blank thread registration failed" };
       }
       return { ok: true, threadId: line, sessionId: line };
     }

@@ -23,6 +23,7 @@ import uuid
 
 import codex_stream
 import codex_live
+import codex_pending
 
 HOME = os.path.expanduser("~")
 CODEX_STATE = os.path.join(HOME, ".codex/state_5.sqlite")
@@ -651,6 +652,8 @@ def run():
     # must not keep listing on the web.
     state_cur.execute("SELECT id FROM threads")
     known_session_ids = {"session-" + row[0] for row in state_cur.fetchall()}
+    pending_threads = codex_pending.load()
+    known_session_ids.update("session-" + thread_id for thread_id in pending_threads)
     state_conn.close()
 
     hist_conn = sqlite3.connect(CODEX_HISTORY)
@@ -675,18 +678,29 @@ def run():
     # keep workspace.json byte-identical across idle sweeps, which is what
     # lets the host's file watcher stay quiet.
     previous_ws_entries = {}
+    previous_seen_paths = set()
     try:
         with open(os.path.join(STORAGES_ROOT, "workspace.json"), "r", encoding="utf-8") as handle:
-            previous_ws_entries = (json.load(handle).get("tables", {}).get("workspaces") or {})
+            previous_workspaces = json.load(handle)
+        previous_ws_entries = previous_workspaces.get("tables", {}).get("workspaces") or {}
+        previous_seen_paths = set((previous_workspaces.get("global") or {}).get("projectsSeen") or [])
     except Exception:
         pass
+    group_roots = dict(live_projects)
+    web_workspace_ids = {}
+    for workspace_id, entry in previous_ws_entries.items():
+        path = entry.get("path")
+        if (entry.get("webAdded") and path and path not in live_projects
+                and path not in previous_seen_paths and os.path.isdir(path)):
+            group_roots.setdefault(path, entry.get("title") or os.path.basename(path))
+            web_workspace_ids[path] = workspace_id
     groups = {}
     loose = []
     for th in threads:
         th_id, title, name, created_at, updated_at, cwd, project_id, rollout_path = th
         if not cwd:
             cwd = "/home/nahida/agents/sever"
-        proj_name = live_projects.get(cwd)
+        proj_name = group_roots.get(cwd)
         if proj_name is None:
             loose.append(th)
             continue
@@ -712,7 +726,7 @@ def run():
         derived_slugs.add(ws_slug)
         ws_dir = os.path.join(SESSIONS_ROOT, ws_slug)
         os.makedirs(ws_dir, exist_ok=True)
-        ws_id = str(uuid.uuid5(uuid.NAMESPACE_URL, proj_name + (cwd or "")))
+        ws_id = web_workspace_ids.get(cwd) or str(uuid.uuid5(uuid.NAMESPACE_URL, proj_name + (cwd or "")))
         # Session headers and projection identities carry a cwd the storage
         # layer requires to be a string; the loose bucket has no directory of
         # its own, so its sessions borrow the fallback root.
@@ -1104,6 +1118,7 @@ def run():
         if proj_name:
             workspace_table[ws_id] = {
                 "path": cwd, "title": proj_name, "sessionIds": sess_ids,
+                **({"webAdded": True} if ws_id in web_workspace_ids.values() else {}),
                 "createdAt": (previous_ws_entries.get(ws_id) or {}).get("createdAt") or now_iso,
                 "updatedAt": now_iso if (
                     (previous_ws_entries.get(ws_id) or {}).get("sessionIds") != sess_ids
@@ -1203,6 +1218,15 @@ def run():
 
     with open(STATE_FILE, "w", encoding="utf-8") as handle:
         json.dump(states, handle, ensure_ascii=False)
+
+    # A blank thread exists only in the app-server until its first turn.
+    # Keep its header and workspace membership through every projection pass;
+    # once real history has been projected, Codex's own row takes over.
+    projected = {session_id.removeprefix("session-") for session_id in proj_cache_sessions}
+    remaining = {thread_id: entry for thread_id, entry in pending_threads.items()
+                 if thread_id not in projected or not item_marks.get(thread_id)}
+    if remaining != pending_threads:
+        codex_pending.save(remaining)
 
     # One small document the host process reads to answer "which conversations
     # are running" and "what is this session called" without touching Codex.

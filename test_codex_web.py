@@ -6,6 +6,7 @@ from unittest import mock
 
 import codex_link
 import codex_live
+import codex_pending
 import setup_isolated
 
 
@@ -20,6 +21,20 @@ class FakeSocket:
 
     def close(self):
         pass
+
+
+def test_blank_thread_registration_uses_selected_workspace(tmp_path):
+    with (mock.patch.object(codex_pending, "BASE_DIR", str(tmp_path)),
+          mock.patch.object(codex_pending, "FILE", str(tmp_path / "pending-threads.json")),
+          mock.patch.object(codex_pending, "LOCK", str(tmp_path / "projection.lock"))):
+        codex_pending.register("thread-1", "workspace-1", "/project/selected")
+        entry = codex_pending.load()["thread-1"]
+        header = json.loads((tmp_path / "sessions" / "--project-selected--"
+                             / "session-thread-1" / "session.jsonl").read_text())
+    assert entry["workspaceId"] == "workspace-1"
+    assert entry["cwd"] == "/project/selected"
+    assert header["id"] == "session-thread-1"
+    assert header["cwd"] == "/project/selected"
 
 
 def test_stop_uses_active_turn_id():

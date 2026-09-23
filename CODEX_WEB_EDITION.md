@@ -31,6 +31,13 @@ page is only a view and an input surface for it.
 | New conversation | `thread/start` |
 | Images | forwarded as `image` input parts |
 
+For a new conversation, the host resolves the selected workspace id to its
+directory before starting a Codex thread. A blank thread has no Codex history
+yet, so codex_pending.py records its workspace and a minimal session header in
+the isolated web state. The projector keeps that record until the first turn
+is available, then replaces it with Codex's history. This keeps the workspace
+selection stable across sidebar updates and page reloads.
+
 Every one of these writes to Codex only. The DSH session log is a read model the
 projector owns, so no control path may resume a DSH agent: a second writer would
 collide with the projector's sequence numbers and the browser would reject the

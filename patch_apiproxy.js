@@ -141,6 +141,19 @@ ensure('handleCodexCreate(', () => code.replace(
 \t\t\t\t}
 \t\t\t\tconst sessionId = request.payload.sessionId ?? \`session-\${randomUUID()}\`;`));
 
+// Workspace picks carry an id, not a cwd. Resolve against the live snapshot,
+// which also contains workspaces added from the browser.
+ensure('handleCodexCreate(cwd, request.payload.workspaceId)', () => code.replace(
+  'const created = handleCodexCreate(request.payload.cwd);',
+  [
+    'const workspaceId = request.payload.workspaceId;',
+    'const selected = workspaceId === undefined ? undefined : codexWorkspaceSnapshot()?.items.find(item => item.workspaceId === workspaceId);',
+    'if (workspaceId !== undefined && selected === undefined) return err(request, { code: "workspace-not-found", message: "workspace not found", details: { workspaceId } });',
+    'const cwd = selected?.path ?? request.payload.cwd;',
+    'const created = handleCodexCreate(cwd, workspaceId);',
+  ].join('\n\t\t\t\t\t'),
+));
+
 // --- 6. live tail of projected Codex events into the mux stream -------
 // Started once per host process and fanned out through the same broadcast()
 // channel DSH uses for its own session events.
