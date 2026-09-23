@@ -9,6 +9,7 @@ import time
 BASE_DIR = "/home/nahida/agents/sever/dsh/.dsh-codex"
 FILE = os.path.join(BASE_DIR, "pending-threads.json")
 LOCK = os.path.join(BASE_DIR, "projection.lock")
+MAX_BLANK_AGE_S = 1860
 
 
 def load():
@@ -25,6 +26,14 @@ def save(entries):
     with open(temp, "w", encoding="utf-8") as handle:
         json.dump(entries, handle, ensure_ascii=False)
     os.replace(temp, FILE)
+
+
+def prune(entries, persisted_ids, now=None):
+    """Discard a blank placeholder after its Codex connection has expired."""
+    now = time.time() if now is None else now
+    return {thread_id: entry for thread_id, entry in entries.items()
+            if thread_id in persisted_ids
+            or now - entry.get("createdAt", 0) < MAX_BLANK_AGE_S}
 
 
 def session_file(thread_id, cwd):

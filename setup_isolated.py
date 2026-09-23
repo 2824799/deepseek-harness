@@ -651,8 +651,13 @@ def run():
     # directories outside this set belong to threads Codex has deleted and
     # must not keep listing on the web.
     state_cur.execute("SELECT id FROM threads")
-    known_session_ids = {"session-" + row[0] for row in state_cur.fetchall()}
+    known_thread_ids = {row[0] for row in state_cur.fetchall()}
     pending_threads = codex_pending.load()
+    active_pending = codex_pending.prune(pending_threads, known_thread_ids)
+    if active_pending != pending_threads:
+        codex_pending.save(active_pending)
+    pending_threads = active_pending
+    known_session_ids = {"session-" + thread_id for thread_id in known_thread_ids}
     known_session_ids.update("session-" + thread_id for thread_id in pending_threads)
     state_conn.close()
 

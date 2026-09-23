@@ -37,6 +37,13 @@ def test_blank_thread_registration_uses_selected_workspace(tmp_path):
     assert header["cwd"] == "/project/selected"
 
 
+def test_expired_blank_placeholder_is_retired():
+    entries = {"expired": {"createdAt": 10}, "live": {"createdAt": 1000},
+               "persisted": {"createdAt": 10}}
+    active = codex_pending.prune(entries, {"persisted"}, now=2000)
+    assert set(active) == {"live", "persisted"}
+
+
 def test_stop_uses_active_turn_id():
     ws = FakeSocket({
         "thread/turns/list": {"ok": True, "value": {"data": [
