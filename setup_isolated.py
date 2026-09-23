@@ -17,6 +17,7 @@ import json
 import os
 import sqlite3
 import shutil
+import shlex
 import time
 import uuid
 
@@ -37,7 +38,7 @@ PERMISSION_FILE = os.path.join(BASE_DIR, "permission-preset.json")
 # session from an older version is rebuilt from its rollout instead of being
 # skipped, because its log is missing whatever the newer rendering adds (for
 # example attached images, or reasoning text that used to be dropped).
-PROJECTION_VERSION = 4
+PROJECTION_VERSION = 8
 
 # Codex item types that each represent one model-visible action, and so each
 # become their own tool row. Projecting only the shell and search calls spliced
@@ -97,14 +98,69 @@ def build_rollout_index():
                     stem = name[:-len(".jsonl")]
                     if "_" in stem:
                         stem = stem.split("_", 1)[0]
-                    marker = stem.rsplit("-", 1)[-1]
+                    marker = stem[-36:]
+                    if len(marker) != 36:
+                        continue
                     index.setdefault(marker, []).append(os.path.join(dirpath, name))
         except OSError:
             continue
     return index
 
 
-def read_rollout_meta(rollout_path, rollout_index=None):
+def _completed_item(record):
+    """Convert a durable rollout item to the older history item's shape."""
+    payload = record.get("payload") or {}
+    if record.get("type") != "event_msg" or payload.get("type") != "item_completed":
+        return None
+    item = payload.get("item") or {}
+    kind = item.get("type")
+    mapping = {
+        "UserMessage": "userMessage", "AgentMessage": "agentMessage",
+        "Reasoning": "reasoning", "CommandExecution": "commandExecution",
+        "FileChange": "fileChange", "McpToolCall": "mcpToolCall",
+        "ContextCompaction": "contextCompaction",
+    }
+    if kind not in mapping:
+        return None
+    data = dict(item)
+    data["type"] = mapping[kind]
+    if kind == "UserMessage":
+        data["content"] = [
+            {"type": "image" if part.get("type") in ("image", "localImage") else "text",
+             **({"url": part.get("url", "")} if part.get("type") in ("image", "localImage")
+                else {"text": part.get("text", "")})}
+            for part in item.get("content") or [] if isinstance(part, dict)
+        ]
+    elif kind == "AgentMessage":
+        data["text"] = NEWLINE.join(part.get("text", "") for part in item.get("content") or []
+                                    if isinstance(part, dict) and isinstance(part.get("text"), str))
+    elif kind == "Reasoning":
+        data["content"] = item.get("raw_content")
+        data["summary"] = item.get("summary_text")
+    elif kind == "CommandExecution":
+        command = item.get("command") or ""
+        data["command"] = shlex.join(command) if isinstance(command, list) else command
+        data["aggregatedOutput"] = item.get("aggregated_output") or item.get("formatted_output") or ""
+        data["exitCode"] = item.get("exit_code")
+    elif kind == "FileChange" and isinstance(item.get("changes"), dict):
+        data["changes"] = [
+            {"path": path, "kind": {"type": change.get("type", "update")},
+             "diff": change.get("diff", ""), "content": change.get("content", "")}
+            for path, change in item["changes"].items() if isinstance(change, dict)
+        ]
+    timestamp = payload.get("completed_at_ms") or payload.get("started_at_ms")
+    if not isinstance(timestamp, int):
+        try:
+            timestamp = int(datetime.datetime.fromisoformat(
+                record["timestamp"].replace("Z", "+00:00")).timestamp() * 1000)
+        except (KeyError, TypeError, ValueError):
+            timestamp = int(time.time() * 1000)
+    return (item.get("id") or str(uuid.uuid4()), data["type"],
+            record.get("ordinal"), timestamp, json.dumps(data, ensure_ascii=False),
+            payload.get("turn_id"))
+
+
+def read_rollout_meta(rollout_path, rollout_index=None, after_ordinal=-1):
     """Per-turn timing and per-ordinal usage recorded by Codex.
 
     Codex writes first-token latency and turn duration to the rollout rather
@@ -113,6 +169,7 @@ def read_rollout_meta(rollout_path, rollout_index=None):
     """
     timings = {}
     usage_records = []
+    recovered = []
     tool_ms = {}
     # Codex rotates a thread's rollout on compaction, so a thread's earlier
     # turns live in sibling files beside the current one. Read them all, or
@@ -122,9 +179,7 @@ def read_rollout_meta(rollout_path, rollout_index=None):
         candidates.append(rollout_path)
         base = os.path.basename(rollout_path)
         # "rollout-<ts>-<threadId>.jsonl" / "...-<threadId>_<suffix>.jsonl"
-        thread_marker = base.rsplit("-", 1)[-1].split(".")[0]
-        if "_" in base:
-            thread_marker = base.split("_", 1)[0].rsplit("-", 1)[-1]
+        thread_marker = base.split("_", 1)[0].removesuffix(".jsonl")[-36:]
         for candidate in (rollout_index or {}).get(thread_marker, []):
             if candidate not in candidates:
                 candidates.append(candidate)
@@ -146,6 +201,12 @@ def read_rollout_meta(rollout_path, rollout_index=None):
                         continue
                     kind = payload.get("type")
                     turn_id = payload.get("turn_id")
+                    if (record.get("type") == "event_msg" and kind == "item_completed"
+                            and isinstance(record.get("ordinal"), int)
+                            and record["ordinal"] > after_ordinal):
+                        converted = _completed_item(record)
+                        if converted is not None:
+                            recovered.append(converted)
                     if kind == "task_complete" and turn_id:
                         started = payload.get("started_at")
                         timings[turn_id] = {
@@ -169,8 +230,9 @@ def read_rollout_meta(rollout_path, rollout_index=None):
                         # line, so the model time this feeds is the turn's
                         # duration minus its tool calls.
                         item = payload.get("item")
-                        if (isinstance(item, dict) and item.get("type") == "CommandExecution"
-                                and turn_id):
+                        if isinstance(item, dict) and item.get("type") in (
+                                "CommandExecution", "McpToolCall", "FileChange",
+                                "DynamicToolCall", "WebSearch", "CollabAgentToolCall") and turn_id:
                             started_ms = payload.get("started_at_ms")
                             completed_ms = payload.get("completed_at_ms")
                             if started_ms and completed_ms and completed_ms > started_ms:
@@ -179,7 +241,7 @@ def read_rollout_meta(rollout_path, rollout_index=None):
             continue
     for turn, ms in tool_ms.items():
         timings.setdefault(turn, {})["toolMs"] = ms
-    return timings, usage_records
+    return timings, usage_records, recovered
 
 
 def attribute_usage(ordinal_to_turn, usage_records):
@@ -205,10 +267,15 @@ def attribute_usage(ordinal_to_turn, usage_records):
             "inputTokens": 0, "outputTokens": 0,
             "cacheReadTokens": 0, "cacheWriteTokens": 0,
         })
-        bucket["inputTokens"] += int(usage.get("input_tokens") or 0)
+        # Codex's input_tokens includes the cached portion. DSH's inputTokens
+        # is the disjoint uncached portion; counting both doubles the divisor.
+        total_input = int(usage.get("input_tokens") or 0)
+        cached = int(usage.get("cached_input_tokens") or 0)
+        written = int(usage.get("cache_write_input_tokens") or 0)
+        bucket["inputTokens"] += max(0, total_input - cached - written)
         bucket["outputTokens"] += int(usage.get("output_tokens") or 0)
-        bucket["cacheReadTokens"] += int(usage.get("cached_input_tokens") or 0)
-        bucket["cacheWriteTokens"] += int(usage.get("cache_write_input_tokens") or 0)
+        bucket["cacheReadTokens"] += cached
+        bucket["cacheWriteTokens"] += written
     return totals
 
 
@@ -223,7 +290,7 @@ def clean_title(name, title):
     return text
 
 
-def emit(cx, out, event):
+def emit(cx, out, event, keep_time=False):
     # Codex stamps each item with its own creation time while the projector adds
     # synthetic ones (a turn's first-token and completion instants), and the two
     # sources occasionally interleave out of order. The browser folds the log by
@@ -231,7 +298,12 @@ def emit(cx, out, event):
     when = event.get("time")
     if isinstance(when, int):
         last = cx.get("last_time")
-        if isinstance(last, int) and when < last:
+        if keep_time:
+            # A metric-only step boundary can precede completed tool rows in
+            # the same turn. Preserve its measured timestamp without moving
+            # the visible conversation's high-water clock backwards.
+            pass
+        elif isinstance(last, int) and when < last:
             event["time"] = last
         else:
             cx["last_time"] = when
@@ -317,7 +389,8 @@ def _file_change_row(data):
         kind = change.get("kind") if isinstance(change.get("kind"), dict) else {}
         change_kind = kind.get("type") or "update"
         diff = change.get("diff")
-        old_text, new_text = _diff_text_pair(diff) if isinstance(diff, str) else (None, "")
+        old_text, new_text = _diff_text_pair(diff) if isinstance(diff, str) and diff else (
+            None, change.get("content") or "")
         if change_kind == "add":
             old_text = None
             added_kinds += 1
@@ -658,6 +731,15 @@ def run():
             label = clean_title(name, title)
             titles[sess_dir_name] = label
             c_ms = int(created_at * 1000) if created_at else int(time.time() * 1000)
+            # After compaction Codex may reset threads.created_at to the new
+            # rollout's creation, while thread_history still contains older
+            # turns. Seeding the session clock from that newer date clamps all
+            # earlier events forward and turns minutes into days of fake LLM
+            # time. The first durable item is the session's real lower bound.
+            hist_cur.execute("SELECT MIN(created_at_ms) FROM thread_items WHERE thread_id = ?", (th_id,))
+            earliest = hist_cur.fetchone()[0]
+            if isinstance(earliest, int) and earliest > 0:
+                c_ms = min(c_ms, earliest)
             st = states.get(sess_dir_name)
             mark = item_marks.get(th_id)
             rollout_mtime = None
@@ -691,6 +773,15 @@ def run():
                 ORDER BY rollout_ordinal ASC
             """, (th_id,))
             items = hist_cur.fetchall()
+            history_max = max((it[2] for it in items if isinstance(it[2], int)), default=-1)
+            timings, usage_records, recovered = read_rollout_meta(
+                rollout_path, rollout_index, history_max)
+            if recovered:
+                # Desktop can keep writing its rollout after its history index
+                # stops updating. The rollout's completed items are the source
+                # of truth for that gap; history remains the source below its
+                # high-water ordinal so the same item is never projected twice.
+                items = sorted([*items, *recovered], key=lambda it: it[2])
             # A thread with no recorded items cannot be projected: listing it
             # would make the browser request a log that does not exist and show
             # "history unavailable".
@@ -708,7 +799,6 @@ def run():
                 "rows": {"title": {"ver": 1, "seq": 3, "val": label}},
             }
 
-            timings, usage_records = read_rollout_meta(rollout_path, rollout_index)
             usage_by_turn = attribute_usage(
                 {it[2]: it[5] for it in items if it[5]}, usage_records)
 
@@ -940,18 +1030,18 @@ def run():
                             cx["step"] = live_step
                             cx["step_open"] = True
                             cx["step_start"] = cx.get("turn_start") or created_ms
-                        # The turn's whole-turn timing is carried by exactly one
-                        # step. Its step/start is the turn's start, so the fold
-                        # reads the turn's real wall time instead of adding a
-                        # whole-turn duration onto every step.
+                        # The turn's model-time sample is carried by exactly
+                        # one step so cumulative stats count it once.
                         elif is_carrier and timing.get("durationMs") and cx.get("turn_start"):
                             if cx["step_open"]:
                                 close_step(created_ms)
                             cx["step"] += 1
-                            cx["step_start"] = cx["turn_start"]
+                            model_ms = max(0, int(timing["durationMs"]) - int(timing.get("toolMs") or 0))
+                            cx["step_start"] = max(cx["turn_start"], created_ms - model_ms)
                             cx["step_open"] = True
-                            emit(cx, out, {"type": "step/start", "time": cx["turn_start"],
-                                           "data": {"turn": cx["turn"], "step": cx["step"]}})
+                            emit(cx, out, {"type": "step/start", "time": cx["step_start"],
+                                           "data": {"turn": cx["turn"], "step": cx["step"]}},
+                                 keep_time=True)
                         if not cx["step_open"]:
                             open_step(created_ms)
 
@@ -963,30 +1053,39 @@ def run():
                             blocks.append({"type": "text", "text": text})
 
                         msg_time = created_ms
+                        timing_stream = []
                         if (is_carrier
                                 and timing.get("durationMs") and timing.get("ttftMs") is not None
                                 and cx["step_start"]
                                 and live_step is None):
                             ttft = int(timing["ttftMs"])
                             model_ms = int(timing["durationMs"]) - int(timing.get("toolMs") or 0)
-                            # A turn whose first token lands at the very end of
-                            # its window leaves no decode span; Codex still
-                            # reports the request's output tokens, which would
-                            # divide into an absurd rate. Such a turn keeps its
-                            # real timestamps and contributes no decode sample.
                             decode_ms = model_ms - ttft
                             if decode_ms >= 100:
-                                emit(cx, out, {
-                                    "type": "assistant/chunk",
-                                    "time": cx["step_start"] + ttft,
-                                    "data": {"turn": cx["turn"], "step": cx["step"],
-                                             "chunk": {"type": "text-delta", "index": 0, "text": " "}},
-                                })
-                                msg_time = cx["step_start"] + max(ttft, model_ms)
+                                # The DSH stats fold reads first-token time
+                                # from the assembled stream, not an unrelated
+                                # assistant/chunk event. The completion time is
+                                # the real item completion; the metric-only
+                                # boundary subtracts measured model time.
+                                timing_stream = [{"type": "chunk",
+                                                  "time": cx["step_start"] + ttft,
+                                                  "chunk": {"type": "text-delta",
+                                                            "index": 0, "text": " "}}]
+                                # The installed DSH release counts live
+                                # assistant/chunk events, while newer releases
+                                # read the assembled stream above. Emit both
+                                # forms so the same measured boundary works
+                                # with either reader.
+                                emit(cx, out, {"type": "assistant/chunk",
+                                               "time": cx["step_start"] + ttft,
+                                               "data": {"turn": cx["turn"], "step": cx["step"],
+                                                        "chunk": {"type": "text-delta",
+                                                                  "index": 0, "text": " "}}},
+                                     keep_time=True)
 
                         emit(cx, out, {
                             "type": "assistant/message", "time": msg_time,
-                            "data": {"turn": cx["turn"], "step": cx["step"], "stream": [],
+                            "data": {"turn": cx["turn"], "step": cx["step"], "stream": timing_stream,
                                      **({} if step_usage is None else {"usage": step_usage}),
                                      "message": {"id": str(uuid.uuid4()), "role": "assistant",
                                                  "content": blocks, "source": dict(MODEL_SOURCE)}},

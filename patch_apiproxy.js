@@ -36,7 +36,7 @@ function ensure(needle, apply) {
 // Both import lines are re-checked independently: an earlier run could have
 // installed the tailer import while the bridge import still named an older,
 // shorter hook list, and guarding on one line alone left the other stale.
-const BRIDGE_IMPORT = `import { handleCodexPrompt, handleCodexArchive, handleCodexRename, handleCodexCreate, handleCodexFork, handleCodexCancel, handleCodexModel, handleCodexModelState } from "${BRIDGE}";`;
+const BRIDGE_IMPORT = `import { handleCodexPrompt, handleCodexArchive, handleCodexRename, handleCodexCreate, handleCodexFork, handleCodexCancel, handleCodexModel, handleCodexModelState, codexModelCatalog } from "${BRIDGE}";`;
 const LIVE_IMPORT = `import { codexSessionListExtras, codexWorkspaceSnapshot, codexWatchLive } from "${BRIDGE}";`;
 const TAILER_IMPORT = `import { startCodexTailer } from "${TAILER}";`;
 if (!code.includes(BRIDGE_IMPORT)) {
@@ -222,6 +222,12 @@ ensure('handleCodexModelState(sessionId)', () => code.replace(
 				const found = await agentFor(sessionId);
 				if ("error" in found) return err(request, found.error);
 				const current = selectionFor(found.agent).current;`));
+
+// The upstream DSH catalog omits effort menus for several OpenCodex models.
+// Overlay Codex model/list so the picker exposes the actual levels and default.
+ensure('codexModelCatalog(catalog.groups)', () => code.replace(
+  'groups: catalog.groups,',
+  'groups: codexModelCatalog(catalog.groups),'));
 
 // --- 10. /permission -> Codex sandbox + approval ------------------------
 // The permission picker is a slash command, and the stock handler resolves the

@@ -119,6 +119,34 @@ def model_state(session_id):
     return {"ok": True, "current": codex_link.current_selection(thread_id)}
 
 
+def model_catalog():
+    """Codex's supported effort levels and defaults for the web model picker."""
+    ws = codex_link.connect(timeout=5)
+    models = {}
+    cursor = None
+    try:
+        while True:
+            response = ws.call("model/list", {"cursor": cursor} if cursor else {}, timeout=10)
+            if not response.get("ok"):
+                return response
+            value = response.get("value") or {}
+            for entry in value.get("data") or []:
+                levels = entry.get("supportedReasoningEfforts") or []
+                models[entry.get("model") or entry.get("id")] = {
+                    "name": entry.get("displayName") or entry.get("model") or entry.get("id"),
+                    "description": entry.get("description"),
+                    "efforts": [{"id": level["reasoningEffort"],
+                                 "name": level["reasoningEffort"]}
+                                for level in levels if level.get("reasoningEffort")],
+                    "defaultEffort": entry.get("defaultReasoningEffort"),
+                }
+            cursor = value.get("nextCursor")
+            if not cursor:
+                return {"ok": True, "models": models}
+    finally:
+        ws.close()
+
+
 def main(argv):
     if len(argv) < 2:
         print(json.dumps({"ok": False, "error": "No action specified"}))
@@ -146,6 +174,8 @@ def main(argv):
             result = set_permission(argv[2], argv[3])
         elif action == "model-state":
             result = model_state(argv[2])
+        elif action == "model-catalog":
+            result = model_catalog()
         elif action == "ping":
             probe = codex_link.WSClient()
             probe.close()

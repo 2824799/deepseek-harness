@@ -280,6 +280,31 @@ export function handleCodexModelState(sessionId) {
   }
 }
 
+/** Fill DSH's effort menus from Codex's authoritative model/list. */
+export function codexModelCatalog(groups) {
+  const res = cp.spawnSync("python3", [
+    "/home/nahida/agents/sever/dsh/codex_bridge.py", "model-catalog"
+  ], { encoding: "utf-8", timeout: 15000 });
+  let models = {};
+  try {
+    const value = JSON.parse((res.stdout || "").trim());
+    if (value.ok) models = value.models || {};
+  } catch { /* retain the DSH catalog while Codex is unavailable */ }
+  return groups.map(group => group.id !== "opencodex" || Object.keys(models).length === 0
+    ? group : ({
+      ...group,
+      models: Object.entries(models).map(([id, entry]) => ({
+        id,
+        name: entry.name || id,
+        ...entry.description ? { description: entry.description } : {},
+        ...entry.efforts.length ? { reasoning: {
+          efforts: entry.efforts,
+          ...entry.defaultEffort ? { defaultEffort: entry.defaultEffort } : {},
+        } } : {},
+      }))
+    }));
+}
+
 /** Switch this thread's sandbox and approval preset through Codex. */
 export function handleCodexPermission(sessionId, preset) {
   const res = cp.spawnSync("python3", [

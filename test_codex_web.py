@@ -6,6 +6,7 @@ from unittest import mock
 
 import codex_link
 import codex_live
+import setup_isolated
 
 
 class FakeSocket:
@@ -113,3 +114,71 @@ def test_running_scan_ignores_events_after_task_complete(tmp_path):
     with rollout.open("a", encoding="utf-8") as handle:
         handle.write("\n" + event("task_started") + "\n")
     assert codex_live._tail_terminal(rollout) is False
+
+
+def test_rollout_recovers_items_missing_from_history_and_counts_cache_once(tmp_path):
+    rollout = tmp_path / "rollout-test.jsonl"
+    records = [
+        {"type": "event_msg", "ordinal": 11,
+         "timestamp": "2026-09-23T03:00:00Z",
+         "payload": {"type": "item_completed", "turn_id": "turn-1",
+                     "item": {"type": "UserMessage", "id": "user-1",
+                              "content": [{"type": "text", "text": "latest"}]}}},
+        {"type": "event_msg", "ordinal": 12,
+         "timestamp": "2026-09-23T03:00:01Z",
+         "payload": {"type": "item_completed", "turn_id": "turn-1",
+                     "item": {"type": "Reasoning", "id": "reason-1",
+                              "raw_content": ["think"], "summary_text": []}}},
+        {"type": "event_msg", "ordinal": 13,
+         "timestamp": "2026-09-23T03:00:02Z",
+         "payload": {"type": "item_completed", "turn_id": "turn-1",
+                     "item": {"type": "AgentMessage", "id": "answer-1",
+                              "content": [{"type": "Text", "text": "reply"}]}}},
+        {"type": "token_usage_record", "ordinal": 14,
+         "payload": {"usage": {"input_tokens": 1000,
+                               "cached_input_tokens": 950, "output_tokens": 20}}},
+    ]
+    rollout.write_text("\n".join(json.dumps(record) for record in records) + "\n")
+    _, usages, items = setup_isolated.read_rollout_meta(str(rollout), after_ordinal=10)
+    assert [it[1] for it in items] == ["userMessage", "reasoning", "agentMessage"]
+    assert setup_isolated.reasoning_text(json.loads(items[1][4])) == "think"
+    assert json.loads(items[2][4])["text"] == "reply"
+    assert setup_isolated.attribute_usage({it[2]: it[5] for it in items}, usages) == {
+        "turn-1": {"inputTokens": 50, "cacheReadTokens": 950,
+                   "cacheWriteTokens": 0, "outputTokens": 20}}
+
+
+def test_model_picker_reads_desktop_selection(tmp_path):
+    rollout = tmp_path / "rollout.jsonl"
+    rollout.write_text(json.dumps({"type": "turn_context", "payload": {
+        "model": "scgpt/gpt-6-sol", "effort": "xhigh"}}) + "\n")
+    codex_dir = tmp_path / ".codex"
+    codex_dir.mkdir()
+    conn = sqlite3.connect(codex_dir / "state_5.sqlite")
+    conn.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT)")
+    conn.execute("INSERT INTO threads VALUES (?, ?)", ("thread-1", str(rollout)))
+    conn.commit()
+    conn.close()
+    with (mock.patch.object(codex_link, "HOME", str(tmp_path)),
+          mock.patch.object(codex_link, "load_selections", return_value={})):
+        assert codex_link.current_selection("thread-1") == {
+            "provider": "opencodex", "model": "scgpt/gpt-6-sol", "reasoningEffort": "xhigh"}
+
+
+def test_web_model_choice_precedes_previous_desktop_turn(tmp_path):
+    rollout = tmp_path / "rollout.jsonl"
+    rollout.write_text(json.dumps({"type": "turn_context",
+        "timestamp": "2026-09-23T03:00:00Z",
+        "payload": {"model": "old", "effort": "high"}}) + "\n")
+    codex_dir = tmp_path / ".codex"
+    codex_dir.mkdir()
+    conn = sqlite3.connect(codex_dir / "state_5.sqlite")
+    conn.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT)")
+    conn.execute("INSERT INTO threads VALUES (?, ?)", ("thread-1", str(rollout)))
+    conn.commit()
+    conn.close()
+    selection = {"thread-1": {"model": "new", "selectedAt": 1790135000000}}
+    with (mock.patch.object(codex_link, "HOME", str(tmp_path)),
+          mock.patch.object(codex_link, "load_selections", return_value=selection)):
+        assert codex_link.current_selection("thread-1") == {
+            "provider": "opencodex", "model": "new"}

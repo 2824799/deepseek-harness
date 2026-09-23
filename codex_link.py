@@ -20,6 +20,7 @@ CLI:
 import base64
 import json
 import os
+import sqlite3
 import socket
 import struct
 import sys
@@ -134,7 +135,7 @@ def save_selection(thread_id, model, effort=None):
     sending it on each turn/start is what makes the web picker authoritative.
     """
     selections = load_selections()
-    entry = {"model": model}
+    entry = {"model": model, "selectedAt": int(time.time() * 1000)}
     if effort:
         entry["effort"] = effort
     selections[thread_id] = entry
@@ -158,10 +159,49 @@ def current_selection(thread_id):
     recorded choice already carries.
     """
     selection = load_selections().get(thread_id) or {}
+    # Desktop model changes bypass the web picker. The last turn_context is
+    # Codex's durable record of the model and effort actually in use.
+    actual = {}
+    actual_at = 0
+    try:
+        db = sqlite3.connect(f"file:{HOME}/.codex/state_5.sqlite?mode=ro", uri=True)
+        row = db.execute("SELECT rollout_path FROM threads WHERE id = ?", (thread_id,)).fetchone()
+        db.close()
+        if row and row[0]:
+            with open(row[0], "rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                offset = handle.tell()
+                prefix = b""
+                while offset and not actual:
+                    count = min(offset, 256 * 1024)
+                    offset -= count
+                    handle.seek(offset)
+                    lines = (handle.read(count) + prefix).split(b"\n")
+                    prefix = lines.pop(0) if offset else b""
+                    for line in reversed(lines):
+                        try:
+                            event = json.loads(line)
+                        except ValueError:
+                            continue
+                        if event.get("type") == "turn_context":
+                            actual = event.get("payload") or {}
+                            stamp = event.get("timestamp") or ""
+                            try:
+                                import datetime
+                                actual_at = int(datetime.datetime.fromisoformat(
+                                    stamp.replace("Z", "+00:00")).timestamp() * 1000)
+                            except (TypeError, ValueError):
+                                pass
+                            break
+    except (OSError, sqlite3.Error):
+        pass
+    preferred = selection if selection.get("selectedAt", 0) > actual_at else actual
+    fallback = actual if preferred is selection else selection
     return {
         "provider": "opencodex",
-        "model": selection.get("model") or default_model(),
-        **({} if not selection.get("effort") else {"reasoningEffort": selection["effort"]}),
+        "model": preferred.get("model") or fallback.get("model") or default_model(),
+        **({"reasoningEffort": preferred.get("effort")}
+           if preferred.get("effort") else {}),
     }
 
 
