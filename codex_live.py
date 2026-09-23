@@ -26,10 +26,11 @@ CODEX_STATE = os.path.join(os.environ.get("HOME", ""), ".codex", "state_5.sqlite
 FRESH_S = 45.0
 TAIL_BYTES = 96 * 1024
 TERMINAL = {("event_msg", "task_complete"), ("event_msg", "turn_aborted")}
+START = ("event_msg", "task_started")
 
 
 def _tail_terminal(path):
-    """True when the rollout's last recognizable event ends a turn."""
+    """True when the most recent turn lifecycle event ended a turn."""
     try:
         size = os.path.getsize(path)
     except OSError:
@@ -52,7 +53,9 @@ def _tail_terminal(path):
         except ValueError:
             continue
         payload = obj.get("payload") or {}
-        last = (obj.get("type"), payload.get("type"))
+        kind = (obj.get("type"), payload.get("type"))
+        if kind == START or kind in TERMINAL:
+            last = kind
     return last in TERMINAL
 
 
@@ -94,7 +97,7 @@ def scan_projects():
     # changes only when the user adds or removes a project.
     previous = read()
     fetched_at = previous.get("projectsAt") or 0
-    if previous.get("projects") and time.time() * 1000 - fetched_at < 30000:
+    if "projects" in previous and previous["projects"] is not None and time.time() * 1000 - fetched_at < 30000:
         return previous["projects"]
     try:
         import codex_link as link
@@ -108,12 +111,27 @@ def scan_projects():
     if not res.get("ok"):
         return None
     projects = {}
-    for entry in (res.get("value") or {}).get("data") or []:
-        name = entry.get("name")
-        for root in entry.get("roots") or []:
-            path = root.get("path") if isinstance(root, dict) else root
-            if path and name:
-                projects[path] = name
+    while True:
+        value = res.get("value") or {}
+        for entry in value.get("data") or []:
+            name = entry.get("name")
+            for root in entry.get("roots") or []:
+                path = root.get("path") if isinstance(root, dict) else root
+                if path and name:
+                    projects[path] = name
+        cursor = value.get("nextCursor")
+        if not cursor:
+            break
+        try:
+            ws = link.connect(timeout=5, experimental=True)
+            try:
+                res = ws.call("project/list", {"cursor": cursor}, timeout=10)
+            finally:
+                ws.close()
+        except Exception:
+            return None
+        if not res.get("ok"):
+            return None
     _PROJECTS_AT[0] = int(time.time() * 1000)
     return projects
 
@@ -126,13 +144,15 @@ def publish(running, projects, titles=None):
     previous = read()
     if projects is None:
         projects = previous.get("projects")
-    doc = {
+    values = {
         "running": sorted(running),
         "projects": projects,
         "titles": titles if titles is not None else previous.get("titles") or {},
         "projectsAt": _PROJECTS_AT[0] or previous.get("projectsAt") or 0,
-        "updatedAt": int(time.time() * 1000),
     }
+    if all(previous.get(key) == value for key, value in values.items()):
+        return previous
+    doc = {**values, "updatedAt": int(time.time() * 1000)}
     tmp = LIVE_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as handle:
         json.dump(doc, handle, ensure_ascii=False)

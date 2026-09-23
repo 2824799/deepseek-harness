@@ -617,8 +617,10 @@ def run():
         if proj_name is None:
             loose.append(th)
             continue
-        groups.setdefault(proj_name, {"title": proj_name, "path": cwd, "threads": []})
-        groups[proj_name]["threads"].append(th)
+        # Paths, unlike display names, identify a project root. Two projects
+        # may share a name and must keep their own conversations.
+        groups.setdefault(cwd, {"title": proj_name, "path": cwd, "threads": []})
+        groups[cwd]["threads"].append(th)
 
     workspace_table = {}
     workspace_ids = []
@@ -627,7 +629,8 @@ def run():
     derived_slugs = set()
     now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
 
-    for proj_name, ginfo in list(groups.items()) + [("", {"title": "", "path": None, "threads": loose})]:
+    for _, ginfo in list(groups.items()) + [("", {"title": "", "path": None, "threads": loose})]:
+        proj_name = ginfo["title"]
         cwd = ginfo["path"]
         # The storage layer derives every session directory from the header
         # cwd, so the loose bucket shares the fallback root's directory; the
@@ -1041,7 +1044,10 @@ def run():
         has_seen = "projectsSeen" in previous_global
         derived_paths = {entry["path"] for entry in workspace_table.values()}
         for ws_id, entry in (previous.get("tables", {}).get("workspaces") or {}).items():
-            if entry.get("path") in derived_paths:
+            path = entry.get("path") or ""
+            if path in derived_paths:
+                continue
+            if path in seen_paths and path not in live_projects:
                 continue
             # A row Codex owns must die with its project; only rows the web
             # added by hand survive. projectsSeen records every path that was
@@ -1050,7 +1056,6 @@ def run():
             # Before the first seen-set exists, a live directory is the only
             # evidence available, which is what the migration run uses.
             if not entry.get("webAdded"):
-                path = entry.get("path") or ""
                 if has_seen:
                     keep = path not in seen_paths and os.path.isdir(path)
                 else:
@@ -1102,7 +1107,7 @@ def run():
 
     # One small document the host process reads to answer "which conversations
     # are running" and "what is this session called" without touching Codex.
-    codex_live.publish(codex_live.scan_running(), live_projects or None, titles)
+    codex_live.publish(codex_live.scan_running(), live_projects, titles)
 
     fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
     lock_fh.close()

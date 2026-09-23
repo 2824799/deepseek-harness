@@ -396,7 +396,9 @@ def send_prompt(thread_id, payload):
             if "active writer" in reason:
                 # Codex Desktop holds the writer lock for this thread; the only
                 # supported channel is the durable queue, which Desktop drains.
-                return queue_prompt(thread_id, items, reason)
+                if mode == "steer":
+                    return {"ok": False, "error": "Codex Desktop owns this turn; steering is unavailable from the web app-server"}
+                return queue_prompt(thread_id, items, reason, payload.get("images") or [])
             if "no rollout found" not in reason and "thread not found" not in reason:
                 return {"ok": False, "error": reason}
             # A thread created moments ago has no rollout file yet, so resume
@@ -412,6 +414,8 @@ def send_prompt(thread_id, payload):
 
         active_turn, _ = thread_is_running(ws, thread_id)
         if active_turn:
+            if mode == "queue":
+                return queue_prompt(thread_id, items, image_paths=payload.get("images") or [])
             # turn/steer takes no model, so a mid-turn message cannot switch it;
             # the choice is already recorded and applies from the next turn.
             res = ws.call(
@@ -426,7 +430,7 @@ def send_prompt(thread_id, payload):
                 return {"ok": True, "mode": "steer", "turnId": active_turn,
                         "stream": stream}
             if "active writer" in json.dumps(res.get("error")):
-                return queue_prompt(thread_id, items, json.dumps(res.get("error")))
+                return {"ok": False, "error": "Codex Desktop owns this turn; steering is unavailable from the web app-server"}
             return {"ok": False, "error": json.dumps(res["error"])}
         params = {"threadId": thread_id, "input": items}
         params.update(model_override)
@@ -438,7 +442,9 @@ def send_prompt(thread_id, payload):
             return {"ok": True, "mode": "start", "turnId": turn.get("id"),
                     "stream": stream}
         if "active writer" in json.dumps(res.get("error")):
-            return queue_prompt(thread_id, items, json.dumps(res.get("error")))
+            if mode == "steer":
+                return {"ok": False, "error": "Codex Desktop owns this turn; steering is unavailable from the web app-server"}
+            return queue_prompt(thread_id, items, json.dumps(res.get("error")), payload.get("images") or [])
         return {"ok": False, "error": json.dumps(res["error"])}
     finally:
         ws.close()
@@ -464,11 +470,12 @@ def hand_off_stream(ws, thread_id, steer, turn_id=None):
     return {"ok": True, "pid": pid, "baseTurn": base_turn}
 
 
-def queue_prompt(thread_id, items, reason=None):
+def queue_prompt(thread_id, items, reason=None, image_paths=None):
     """Fall back to the durable CLI queue that Codex Desktop drains."""
     text = "\n".join(block.get("text", "") for block in items if block.get("type") == "text").strip()
-    if not text:
-        return {"ok": False, "error": f"Desktop holds this thread and images cannot be queued: {reason}"}
+    image_paths = [path for path in image_paths or [] if os.path.isfile(path)]
+    if not text and not image_paths:
+        return {"ok": False, "error": f"queue requires text or an image: {reason}"}
     codex_bin = os.path.expanduser("~/.local/bin/codex")
     if not os.path.exists(codex_bin):
         codex_bin = "/usr/lib/chatgpt/resources/codex"
@@ -477,8 +484,14 @@ def queue_prompt(thread_id, items, reason=None):
     env = os.environ.copy()
     env["PATH"] = os.path.expanduser("~/.local/bin") + ":" + env.get("PATH", "")
     try:
+        command = [codex_bin, "queue", "--thread", thread_id, "--message", text]
+        selected_model = (load_selections().get(thread_id) or {}).get("model")
+        if selected_model:
+            command.extend(["-m", selected_model])
+        for image_path in image_paths:
+            command.extend(["-i", image_path])
         res = subprocess.run(
-            [codex_bin, "queue", "--thread", thread_id, "--message", text],
+            command,
             capture_output=True, text=True, env=env, timeout=30,
         )
     except Exception as exc:  # noqa: BLE001 - reported to the web UI as a failure
@@ -544,6 +557,8 @@ def set_archived(thread_id, archived):
         reason = json.dumps(res.get("error"))
     finally:
         ws.close()
+    if "active writer" not in reason:
+        return {"ok": False, "error": reason}
     # Codex Desktop keeps a writer lock on every thread it has open, and both
     # the app-server and the CLI refuse to archive those. Record the intent in
     # the same table the CLI uses so it still takes effect and survives.
@@ -558,6 +573,9 @@ def set_archived(thread_id, archived):
             "UPDATE threads SET archived = ?, archived_at = ? WHERE id = ?",
             (1 if archived else 0, int(time.time()) if archived else None, thread_id),
         )
+        if cur.rowcount != 1:
+            conn.close()
+            return {"ok": False, "error": f"thread {thread_id} no longer exists"}
         conn.commit()
         conn.close()
         return {"ok": True, "fallback": "state_5.sqlite", "reason": reason}
@@ -581,17 +599,15 @@ def interrupt_turn(thread_id):
     """Stop the thread's in-flight turn (the web UI's stop button)."""
     ws = connect()
     try:
-        res = ws.call("thread/read", {"threadId": thread_id, "includeTurns": False}, timeout=15)
-        if not res["ok"]:
-            return {"ok": False, "error": json.dumps(res["error"])}
-        thread = (res["value"] or {}).get("thread") or {}
-        turns = thread.get("turns") or []
-        active = None
-        for turn in reversed(turns):
-            if turn.get("status") == "inProgress":
-                active = turn.get("id")
-                break
+        active, lookup = thread_is_running(ws, thread_id)
+        if not lookup["ok"]:
+            return {"ok": False, "error": json.dumps(lookup["error"])}
         if active is None:
+            # Desktop-owned turns are absent from this separate app-server's
+            # loaded-turn list. Do not acknowledge a stop we cannot perform.
+            import codex_live
+            if thread_id in codex_live.scan_running():
+                return {"ok": False, "error": "This Codex Desktop turn cannot be interrupted through the web app-server"}
             return {"ok": True, "interrupted": False, "reason": "no active turn"}
         res = ws.call("turn/interrupt", {"threadId": thread_id, "turnId": active}, timeout=15)
         return {"ok": res["ok"], "interrupted": res["ok"],

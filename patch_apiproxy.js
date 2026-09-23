@@ -160,9 +160,17 @@ ensure('handleCodexCancel(sessionId)', () => code.replace(
   `cancel(request) {
 \t\t\t\tconst { sessionId } = request.payload;
 \t\t\t\tif (${GUARD}) {
-\t\t\t\t\thandleCodexCancel(sessionId);
-\t\t\t\t\treturn Promise.resolve(ok(request, { accepted: true }));
+\t\t\t\t\tconst stopped = handleCodexCancel(sessionId);
+\t\t\t\t\tif (!stopped || !stopped.ok) return Promise.resolve(err(request, {
+\t\t\t\t\t\tcode: "internal", message: "Codex stop failed: " + (stopped && stopped.error), details: { sessionId }
+\t\t\t\t\t}));
+\t\t\t\t\treturn Promise.resolve(ok(request, { accepted: stopped.interrupted === true }));
 \t\t\t\t}`));
+
+// Upgrade the older stop hook in an already patched installation.
+ensure('const stopped = handleCodexCancel(sessionId)', () => code.replace(
+  'handleCodexCancel(sessionId);\n\t\t\t\t\treturn Promise.resolve(ok(request, { accepted: true }));',
+  'const stopped = handleCodexCancel(sessionId);\n\t\t\t\t\tif (!stopped || !stopped.ok) return Promise.resolve(err(request, { code: "internal", message: "Codex stop failed: " + (stopped && stopped.error), details: { sessionId } }));\n\t\t\t\t\treturn Promise.resolve(ok(request, { accepted: stopped.interrupted === true }));'));
 
 // --- 8. model picker -> Codex turn/start model override -----------------
 ensure('handleCodexModel(sessionId, model, reasoningEffort)', () => code.replace(
@@ -319,6 +327,14 @@ ensure('codexWatchLive(() => {', () => code.replace(
 \t\t\t\t\tfor (const dispose of disposers) dispose();
 \t\t\t\t});`));
 
+// Publish project removals as well as updates to already open pages.
+ensure('knownCodexWorkspaceIds = new Set()', () => code.replace(
+  '\t\t\t\tif (' + GUARD + ') disposers.push(codexWatchLive(() => {',
+  '\t\t\t\tconst knownCodexWorkspaceIds = new Set();\n\t\t\t\tif (' + GUARD + ') disposers.push(codexWatchLive(() => {'));
+ensure('const currentCodexWorkspaceIds = new Set(', () => code.replace(
+  '\t\t\t\t\tif (!snapshot) return;\n\t\t\t\t\tfor (const workspace of snapshot.items) queue.push(frame({',
+  '\t\t\t\t\tif (!snapshot) return;\n\t\t\t\t\tconst currentCodexWorkspaceIds = new Set(snapshot.items.map((item) => item.workspaceId));\n\t\t\t\t\tfor (const workspaceId of knownCodexWorkspaceIds) if (!currentCodexWorkspaceIds.has(workspaceId)) queue.push(frame({ type: "host/workspace-removed", workspaceId }));\n\t\t\t\t\tknownCodexWorkspaceIds.clear();\n\t\t\t\t\tfor (const workspaceId of currentCodexWorkspaceIds) knownCodexWorkspaceIds.add(workspaceId);\n\t\t\t\t\tfor (const workspace of snapshot.items) queue.push(frame({'));
+
 // --- 14. client accepts the extra session.list columns ------------------
 {
   const CC = '/home/nahida/.local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-client-connection/lib/client.js';
@@ -353,6 +369,24 @@ ensure('codexWatchLive(() => {', () => code.replace(
       console.log('  applied: client silent list poll');
     } else {
       console.error('  MISS: client refreshList anchor');
+      process.exitCode = 1;
+    }
+  }
+}
+
+// A Codex project may be removed and then re-added with its stable id. Clear
+// the client tombstone when the projector sends a fresh workspace frame.
+{
+  const CR = '/home/nahida/.local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-client-runtime/lib/client.js';
+  let rcode = fs.readFileSync(CR, 'utf-8');
+  const anchor = 'if (envelope.payload.type === "host/workspace-changed") this.upsert(envelope.payload.workspace);';
+  if (!rcode.includes('codexReaddedWorkspace')) {
+    if (rcode.includes(anchor)) {
+      rcode = rcode.replace(anchor, 'if (envelope.payload.type === "host/workspace-changed") {\n\t\t\t\t\tif (globalThis.location?.port === "3080") { this.removedIds.delete(envelope.payload.workspace.workspaceId); /* codexReaddedWorkspace */ }\n\t\t\t\t\tthis.upsert(envelope.payload.workspace);\n\t\t\t\t}');
+      fs.writeFileSync(CR, rcode, 'utf-8');
+      console.log('  applied: client project re-add');
+    } else {
+      console.error('  MISS: client project re-add anchor');
       process.exitCode = 1;
     }
   }

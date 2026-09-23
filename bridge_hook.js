@@ -72,6 +72,7 @@ export function codexWorkspaceSnapshot() {
 export function codexWatchLive(onChange) {
   const seen = { live: "", workspace: "" };
   const check = () => {
+    let changed = false;
     for (const [key, file] of [["live", LIVE_FILE], ["workspace", WORKSPACE_FILE]]) {
       let content = "";
       try {
@@ -84,8 +85,9 @@ export function codexWatchLive(onChange) {
       // set out to every open page.
       if (content === seen[key]) continue;
       seen[key] = content;
-      onChange(key);
+      changed = true;
     }
+    if (changed) onChange();
   };
   check();
   const timer = setInterval(() => {
@@ -104,14 +106,15 @@ export async function handleCodexPrompt(sessionId, mode, content) {
   const fullText = textParts.join("\n");
   const imgParts = content.filter(p => p.type === "image");
   const savedImgPaths = [];
+  let tmpDir;
   if (imgParts.length > 0) {
-    const tmpDir = "/tmp/codex_dsh_uploads";
-    fs.mkdirSync(tmpDir, { recursive: true });
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-dsh-upload-"));
     for (let i = 0; i < imgParts.length; i++) {
       const img = imgParts[i];
-      const ext = img.mediaType ? img.mediaType.split("/")[1] || "png" : "png";
+      const subtype = img.mediaType?.split("/")[1];
+      const ext = ["png", "jpeg", "jpg", "webp", "gif"].includes(subtype) ? subtype : "png";
       const imgFile = path.join(tmpDir, `upload_${Date.now()}_${i}.${ext}`);
-      fs.writeFileSync(imgFile, Buffer.from(img.data, "base64"));
+      fs.writeFileSync(imgFile, Buffer.from(img.data, "base64"), { flag: "wx", mode: 0o600 });
       savedImgPaths.push(imgFile);
     }
   }
@@ -120,12 +123,17 @@ export async function handleCodexPrompt(sessionId, mode, content) {
     images: savedImgPaths,
     mode: mode || "followup"
   });
-  const res = cp.spawnSync("python3", [
-    "/home/nahida/agents/sever/dsh/codex_bridge.py",
-    "prompt",
-    sessionId,
-    bridgePayload
-  ], { encoding: "utf-8" });
+  let res;
+  try {
+    res = cp.spawnSync("python3", [
+      "/home/nahida/agents/sever/dsh/codex_bridge.py",
+      "prompt",
+      sessionId,
+      bridgePayload
+    ], { encoding: "utf-8" });
+  } finally {
+    if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 
   let parsed;
   try {
@@ -216,11 +224,16 @@ export function handleCodexFork(sessionId) {
 }
 
 export function handleCodexCancel(sessionId) {
-  cp.spawnSync("python3", [
+  const res = cp.spawnSync("python3", [
     "/home/nahida/agents/sever/dsh/codex_bridge.py",
     "cancel",
     sessionId
-  ]);
+  ], { encoding: "utf-8" });
+  try {
+    return JSON.parse((res.stdout || "").trim());
+  } catch (e) {
+    return { ok: false, error: res.stderr || res.stdout || String(e) };
+  }
 }
 
 /**
