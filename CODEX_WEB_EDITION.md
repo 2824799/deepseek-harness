@@ -55,24 +55,43 @@ collide with the projector's sequence numbers.
 ## Live conversation
 
 The sync daemon checks Codex threads every 700 ms and refreshes the project
-list at most once every 3 seconds. It keeps per-rollout byte cursors
-across sweeps and skips unchanged sessions, including those without SQLite
-history items. The browser follows the projected JSONL by byte offset.
+list at most once every 3 seconds. It keeps per-rollout byte cursors, reads
+only new history rows, and caches the history summary until SQLite or its WAL
+changes. Session directories are indexed once per sweep rather than probing
+every thread under every workspace. Unchanged sessions are skipped.
+The browser follows JSONL file notifications with a 25 ms coalescing window
+and a one-second fallback scan. Startup primes only the final 64 KiB of each
+existing log; new sessions deliver their opening events.
 
 Codex sends token deltas on the socket that started a web turn. The detached
 stream follower forwards these deltas through a local Unix socket. The sync
 daemon writes them into the same projected log as the structural events.
+The follower batches deltas over 80 ms and retains notifications that precede
+the turn/start reply. Each batch carries its Codex item and turn IDs. A batch
+waits for its predecessor to be projected; late deltas for a completed item
+are discarded instead of appearing in the next item's step. Log-tail state is
+cached, so each batch parses only newly appended bytes.
 Desktop-owned turns are read from completed rollout items; a completed
 reasoning item is published immediately, even when the next tool or answer has
-not arrived. An older checkpoint holding unpublished reasoning is drained on
-the next sweep. A projected session remains listed while Codex's history index
+not arrived. Reasoning gets its own DSH step, because DSH displays only the
+last settled assistant message per step. This prevents subsequent tools and
+answers from replacing it, both live and in history. Projection version 9
+rebuilds older projections from Codex data to repair existing histories.
+An older checkpoint holding unpublished reasoning is drained on the next
+sweep. A projected session remains listed while Codex's history index
 lags behind its rollout, including an index with no rows for that thread.
 Unchanged workspace, projection-cache and checkpoint files are not rewritten.
 
-On the current dataset, an isolated warm sweep costs about 50 ms CPU, compared
-with about 470 ms before these changes. The first sweep still parses backlog,
-and the projected logs still use disk space. This benchmark does not establish
-Codex Desktop's internal CPU use.
+On the September 24 dataset, three warm sweeps under the same Python profiler
+cost 20–21 ms CPU each, compared with 100–101 ms before this change. Initial
+rebuilds still parse backlog and projections still use disk space. This
+measurement does not establish Codex Desktop's internal CPU use.
+
+Actual display cadence depends on when Codex exposes data. Desktop-generated
+tokens not yet written to rollout remain unavailable to the file reader.
+In an isolated A6-C/deepseek-v4.1-flash test, 255 answer deltas arrived at the
+app-server socket in a few milliseconds; the web forwards that burst without
+artificially replaying it as slower token generation.
 
 Reasoning text is requested with detailed summaries when the model exposes it.
 

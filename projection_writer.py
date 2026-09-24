@@ -53,6 +53,9 @@ class ProjectionWriter:
     def _append(request):
         if not isinstance(request, dict):
             return None
+        if request.get("itemId"):
+            from setup_isolated import append_live_chunks
+            return append_live_chunks(request)
         session_id = request.get("sessionId")
         chunks = request.get("chunks")
         if (not isinstance(session_id, str) or not session_id.startswith("session-")
@@ -90,10 +93,12 @@ class ProjectionWriter:
 
 
 def send_chunks(session_id, chunks, min_turn=None, only_turn=None,
-                socket_path=SOCKET_PATH):
+                socket_path=SOCKET_PATH, *, item_id=None, turn_id=None,
+                after_item_id=None):
     """Forward Codex deltas to the projector; the streamer never writes its log."""
     request = {"sessionId": session_id, "chunks": chunks,
-               "minTurn": min_turn, "onlyTurn": only_turn}
+               "minTurn": min_turn, "onlyTurn": only_turn,
+               "itemId": item_id, "turnId": turn_id, "afterItemId": after_item_id}
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
             client.settimeout(65)

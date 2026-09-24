@@ -4,6 +4,8 @@ import json
 import os
 import tempfile
 import unittest
+import sqlite3
+from unittest import mock
 
 import setup_isolated
 
@@ -108,6 +110,23 @@ class RolloutIncrementalTests(unittest.TestCase):
         self.assertEqual((before.st_ino, before.st_mtime_ns),
                          (after.st_ino, after.st_mtime_ns))
         self.assertTrue(setup_isolated.write_json_if_changed(snapshot, {"x": 2}))
+
+    def test_history_summary_skips_unchanged_sqlite_and_tracks_wal_appends(self):
+        database = os.path.join(self.tmp.name, "history.sqlite")
+        with sqlite3.connect(database) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("CREATE TABLE thread_items (thread_id TEXT, rollout_ordinal INTEGER, created_at_ms INTEGER)")
+            conn.execute("INSERT INTO thread_items VALUES ('one', 1, 10)")
+            conn.commit()
+            statements = []
+            conn.set_trace_callback(statements.append)
+            with mock.patch.object(setup_isolated, "CODEX_HISTORY", database):
+                self.assertEqual(setup_isolated.history_summary(conn), [("one", 1, 1, 10)])
+                self.assertEqual(setup_isolated.history_summary(conn), [("one", 1, 1, 10)])
+                self.assertEqual(len(statements), 1)
+                conn.execute("INSERT INTO thread_items VALUES ('one', 2, 20)")
+                conn.commit()
+                self.assertEqual(setup_isolated.history_summary(conn), [("one", 2, 2, 10)])
 
 
 if __name__ == "__main__":

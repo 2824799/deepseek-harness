@@ -42,3 +42,61 @@ test('live tail keeps byte offsets across Chinese text and a split JSONL line', 
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('startup reads a bounded tail and a new session pushes its first events', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-tail-start-'));
+  const folder = path.join(root, 'workspace', 'session-existing');
+  fs.mkdirSync(folder, { recursive: true });
+  const file = path.join(folder, 'session.jsonl');
+  const row = (seq) => JSON.stringify({ seq, type: 'assistant/chunk', data: { text: '中文' } }) + '\n';
+  fs.writeFileSync(file, Array.from({ length: 20000 }, (_, seq) => row(seq)).join(''));
+  const received = [];
+  const original = fs.readSync;
+  const lengths = [];
+  let stop;
+  try {
+    fs.readSync = (...args) => { lengths.push(args[3]); return original(...args); };
+    stop = startCodexTailer(frame => received.push(frame), undefined, { root, intervalMs: 5 });
+  } finally {
+    fs.readSync = original;
+  }
+  try {
+    assert.ok(lengths.length > 0 && lengths.every(length => length <= 64 * 1024));
+    fs.appendFileSync(file, row(20000));
+    await until(() => received.length === 1);
+    assert.equal(received[0].event.seq, 20000);
+    const next = path.join(root, 'workspace', 'session-new');
+    fs.mkdirSync(next);
+    fs.writeFileSync(path.join(next, 'session.jsonl'), row(0) + row(1));
+    await until(() => received.length === 3);
+    assert.deepEqual(received.slice(1).map(frame => [frame.sessionId, frame.event.seq]), [
+      ['session-new', 0], ['session-new', 1],
+    ]);
+  } finally {
+    stop?.();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('watch notifications push before the fallback poll and stop on abort', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-tail-watch-'));
+  const folder = path.join(root, 'workspace', 'session-watch');
+  fs.mkdirSync(folder, { recursive: true });
+  const file = path.join(folder, 'session.jsonl');
+  fs.writeFileSync(file, '');
+  const controller = new AbortController();
+  const received = [];
+  const stop = startCodexTailer(frame => received.push(frame), controller.signal,
+    { root, intervalMs: 60000, flushMs: 1 });
+  try {
+    fs.appendFileSync(file, JSON.stringify({ seq: 0, type: 'assistant/chunk' }) + '\n');
+    await until(() => received.length === 1);
+    controller.abort();
+    fs.appendFileSync(file, JSON.stringify({ seq: 1, type: 'assistant/chunk' }) + '\n');
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(received.length, 1);
+  } finally {
+    stop();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

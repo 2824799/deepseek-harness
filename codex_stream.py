@@ -11,7 +11,9 @@ projected log, including its structural events.
 import fcntl
 import json
 import os
+import socket
 import time
+from collections import OrderedDict
 
 NEWLINE = chr(10)
 SESSIONS_ROOT = os.path.join(os.environ.get("DSH_HOME") or
@@ -22,6 +24,7 @@ IDLE_TIMEOUT_S = 300
 HARD_TIMEOUT_S = 7200
 FLUSH_INTERVAL_S = 0.08
 DEBUG_LOG = os.environ.get("DSH_CODEX_STREAM_DEBUG")
+_TAIL_CACHE = OrderedDict()
 
 
 def _debug(message):
@@ -50,15 +53,30 @@ def find_session_file(session_id):
 
 def _scan(fh):
     """Read a log's tail: highest seq, open turn/step, and any torn last line."""
-    fh.seek(0, os.SEEK_END)
-    size = fh.tell()
-    start = max(0, size - TAIL_WINDOW)
-    fh.seek(start)
-    data = fh.read()
-    return _fold(data, start, size)
+    stat = os.fstat(fh.fileno())
+    key = os.path.abspath(fh.name)
+    identity = (stat.st_dev, stat.st_ino)
+    cached = _TAIL_CACHE.get(key)
+    valid = (cached and cached["identity"] == identity and cached["size"] <= stat.st_size
+             and (cached["size"] < stat.st_size or cached["mtime"] == stat.st_mtime_ns))
+    if valid and cached["size"] == stat.st_size:
+        return dict(cached["state"])
+    initial = cached["state"] if valid else None
+    start = cached["offset"] if valid else max(0, stat.st_size - TAIL_WINDOW)
+    raw = os.pread(fh.fileno(), stat.st_size - start, start)
+    offset = start + raw.rfind(b"\n") + 1
+    state = _fold(raw.decode("utf-8", errors="replace"), start, stat.st_size, initial)
+    # Text positions are not byte offsets for Chinese or image metadata.
+    state["tornAt"] = offset if raw and not raw.endswith(b"\n") else None
+    _TAIL_CACHE[key] = {"identity": identity, "size": stat.st_size,
+                        "mtime": stat.st_mtime_ns, "offset": offset, "state": state}
+    _TAIL_CACHE.move_to_end(key)
+    while len(_TAIL_CACHE) > 64:
+        _TAIL_CACHE.popitem(last=False)
+    return dict(state)
 
 
-def _fold(data, start, size):
+def _fold(data, start, size, initial=None):
     """Fold a log slice into the structural state it ends in."""
     torn_at = None
     if data and not data.endswith(NEWLINE):
@@ -66,11 +84,12 @@ def _fold(data, start, size):
         torn_at = start + cut + 1
         data = data[:cut + 1] if cut >= 0 else ""
     lines = data.split(NEWLINE)
-    if start > 0 and lines:
+    if start > 0 and lines and initial is None:
         lines = lines[1:]
-    state = {"maxSeq": -1, "maxTime": None, "turn": 0, "step": 0,
+    state = dict(initial) if initial is not None else {"maxSeq": -1, "maxTime": None, "turn": 0, "step": 0,
              "stepOpen": False, "turnOpen": False, "tornAt": torn_at,
              "stepHasChunks": False}
+    state["tornAt"] = torn_at
     for line in lines:
         line = line.strip()
         if not line:
@@ -218,7 +237,7 @@ def _owns(params, turn_id, method):
                   "account/rateLimits/updated", "thread/goal/cleared",
                   "mcpServer/startupStatus/updated", "error"):
         return True
-    reported = params.get("turnId")
+    reported = params.get("turnId") or (params.get("turn") or {}).get("id")
     return reported in (None, turn_id)
 
 
@@ -258,133 +277,95 @@ def spawn_streamer(ws, thread_id, session_id, base_turn, turn_id=None):
 
 
 def stream_turn(ws, thread_id, session_id, base_turn, turn_id=None):
-    """Follow one turn's deltas and append them until the turn ends."""
-    _debug(f"stream_turn start thread={thread_id} session={session_id} "
-           f"base_turn={base_turn} turn_id={turn_id}")
-    path = None
-    for _ in range(150):
-        path = find_session_file(session_id)
-        if path:
-            break
-        time.sleep(0.2)
-    if not path:
-        _debug("no session file found; aborting")
-        return
-    _debug(f"session file {path}")
+    """Forward item-scoped deltas; the projector owns their step placement."""
+    from projection_writer import send_chunks
+    from codex_link import WSError
 
-    index_of = {}
-    next_index = [0]
-    kind_of = {}
-    buffer = []
-    placement = {"turn": None, "step": None}
-    last_flush = [0.0]
-
-    def reset_blocks():
-        """Forget the block layout of a step that has closed.
-
-        The projector closes a step as soon as Codex reports the item complete,
-        which can be a few milliseconds before the last delta reaches this
-        socket. Those trailing chunks must not land in the next step, so the
-        layout is rebuilt from the new step's own item/started notifications.
-        """
-        index_of.clear()
-        kind_of.clear()
-        del next_index[:]
-        next_index.append(0)
-        buffer.clear()
-
-    def block_for(item_id, kind):
-        """The stream index for one item, opening its block on first use.
-
-        A block is opened lazily because a provider that reports no reasoning
-        summary still announces its reasoning items: opening a block on the
-        announcement alone would paint empty reasoning bubbles while the answer
-        streams.
-        """
-        index = index_of.get(item_id)
-        if index is None:
-            index = next_index[0]
-            next_index[0] += 1
-            index_of[item_id] = index
-            kind_of[item_id] = kind
-            buffer.append({"type": "block-start", "index": index, "blockType": kind})
-        return index
+    pending = []
+    items = {}
+    predecessor = None
+    last_flush = 0.0
+    completed_at = None
+    idle_deadline = time.monotonic() + IDLE_TIMEOUT_S
+    hard_deadline = time.monotonic() + HARD_TIMEOUT_S
 
     def flush():
-        """Forward buffered Codex deltas to the projection writer."""
-        if not buffer:
-            return True
-        from projection_writer import send_chunks
-        result = send_chunks(
-            session_id, buffer,
-            min_turn=base_turn if placement["turn"] is None else None,
-            only_turn=placement["turn"])
-        _debug(f"flush n={len(buffer)} placement={placement} result={result}")
-        if result is None:
-            return False
-        if result.get("dropped"):
-            buffer.clear()
-            return True
-        if placement["turn"] is None:
-            # Lock onto the turn the log actually opened for these deltas. That
-            # is the turn the model is answering in, whatever ordinal the
-            # projector assigned it.
-            placement["turn"] = result["turn"]
-            placement["step"] = result["step"]
-        elif result["step"] != placement["step"]:
-            placement["step"] = result["step"]
-            reset_blocks()
-            return True
-        buffer.clear()
-        last_flush[0] = time.time()
-        return True
+        nonlocal last_flush
+        while pending:
+            batch = pending[0]
+            result = send_chunks(session_id, batch["chunks"], item_id=batch["id"],
+                                 turn_id=batch["turn"], after_item_id=batch["after"])
+            _debug(f"flush item={batch['id']} after={batch['after']} result={result}")
+            if result is None:
+                break
+            pending.pop(0)
+        last_flush = time.monotonic()
 
-    ws.sock.settimeout(0.5)
-    idle_deadline = time.time() + IDLE_TIMEOUT_S
-    hard_deadline = time.time() + HARD_TIMEOUT_S
+    def delta(item_id, source_turn, kind, text, channel=None, part=0):
+        if not item_id or not source_turn or not text:
+            return
+        state = items.setdefault(item_id, {"after": predecessor, "started": False,
+                                          "channel": channel, "part": part})
+        # Raw text and its summary are alternative representations, not two
+        # consecutive paragraphs. Prefer exposed text just like the replay path.
+        if state["channel"] == "raw" and channel == "summary":
+            return
+        restart = channel == "raw" and state["channel"] == "summary"
+        if not pending or pending[-1]["id"] != item_id:
+            pending.append({"id": item_id, "turn": source_turn,
+                            "after": state["after"], "chunks": []})
+        chunks = pending[-1]["chunks"]
+        if not state["started"] or restart:
+            chunks.append({"type": "block-start", "index": 0, "blockType": kind})
+            state["started"] = True
+        elif part != state["part"]:
+            text = "\n" + text
+        state["channel"] = channel
+        state["part"] = part
+        chunk_type = "reasoning-delta" if kind == "reasoning" else "text-delta"
+        if chunks and chunks[-1]["type"] == chunk_type:
+            chunks[-1]["text"] += text
+        else:
+            chunks.append({"type": chunk_type, "index": 0, "text": text})
 
-    while time.time() < hard_deadline and time.time() < idle_deadline:
-        line = None
+    while time.monotonic() < min(hard_deadline, idle_deadline):
         try:
-            line = ws.recv_text(timeout=0.5)
-        except Exception:
-            line = None
-        if line:
-            idle_deadline = time.time() + IDLE_TIMEOUT_S
-            try:
-                message = json.loads(line)
-            except Exception:
-                message = None
-            method = (message or {}).get("method")
-            if method:
-                _debug(f"method {method}")
-                params = message.get("params") or {}
-                if params.get("threadId") in (None, thread_id) and _owns(params, turn_id, method):
-                    if method == "item/started":
-                        item = params.get("item") or {}
-                        kind = item.get("type")
-                        item_id = item.get("id")
-                        if item_id is not None and kind in ("agentMessage", "reasoning"):
-                            kind_of.setdefault(item_id, "text" if kind == "agentMessage" else "reasoning")
-                    elif method == "item/agentMessage/delta":
-                        item_id = params.get("itemId")
-                        delta = params.get("delta") or ""
-                        if item_id and delta:
-                            index = block_for(item_id, kind_of.get(item_id, "text"))
-                            buffer.append({"type": "text-delta", "index": index, "text": delta})
-                    elif method in ("item/reasoning/summaryTextDelta",
-                                    "item/reasoning/textDelta"):
-                        item_id = params.get("itemId")
-                        delta = params.get("delta") or ""
-                        if item_id and delta:
-                            index = block_for(item_id, "reasoning")
-                            buffer.append({"type": "reasoning-delta", "index": index, "text": delta})
-                    elif method == "turn/completed":
-                        _debug("turn/completed; flushing and exiting")
-                        flush()
-                        return
-        if buffer and time.time() - last_flush[0] >= FLUSH_INTERVAL_S:
+            message = ws.recv_notification(timeout=FLUSH_INTERVAL_S)
+        except (TimeoutError, socket.timeout):
+            message = None
+        except (OSError, ValueError, WSError):
+            break
+        if message:
+            idle_deadline = time.monotonic() + IDLE_TIMEOUT_S
+            method = message.get("method")
+            params = message.get("params") or {}
+            _debug(f"notify method={method} item={params.get('itemId') or (params.get('item') or {}).get('id')} "
+                   f"characters={len(params.get('delta') or '')}")
+            if params.get("threadId") not in (None, thread_id) or not _owns(params, turn_id, method):
+                continue
+            source_turn = params.get("turnId") or turn_id
+            if method == "item/started":
+                item = params.get("item") or {}
+                if item.get("id"):
+                    items.setdefault(item["id"], {"after": predecessor, "started": False,
+                                                  "channel": None, "part": 0})
+            elif method == "item/completed":
+                item = params.get("item") or {}
+                predecessor = item.get("id") or predecessor
+            elif method == "item/agentMessage/delta":
+                delta(params.get("itemId"), source_turn, "text", params.get("delta"))
+            elif method in ("item/reasoning/summaryTextDelta", "item/reasoning/textDelta"):
+                raw = method == "item/reasoning/textDelta"
+                delta(params.get("itemId"), source_turn, "reasoning", params.get("delta"),
+                      "raw" if raw else "summary",
+                      params.get("contentIndex" if raw else "summaryIndex", 0))
+            elif method == "turn/completed":
+                completed_at = time.monotonic()
+        if pending and time.monotonic() - last_flush >= FLUSH_INTERVAL_S:
             flush()
+        if completed_at is not None:
+            if not pending or time.monotonic() - completed_at > 10:
+                break
     flush()
 
 

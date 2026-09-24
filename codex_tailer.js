@@ -1,156 +1,167 @@
-/**
- * Live-tail bridge for the DSH web edition.
- *
- * The web edition renders Codex threads that the sync daemon projects into
- * JSONL files. DSH only emits session/event mux frames for agents it runs
- * itself, so a projected Codex thread would otherwise stay frozen in the
- * browser until the page was reloaded. This tailer watches the projected
- * session files and pushes every newly appended event into the mux stream,
- * which is what makes the web conversation update while Codex is working.
- *
- * Reads are offset-based. A streamed turn appends token deltas every few
- * milliseconds, so re-reading and re-parsing the whole log on each change would
- * cost hundreds of megabytes of parsing per second on a long conversation.
- */
+/** Watch projector-owned JSONL appends and forward them to the stock DSH mux. */
 import fs from "node:fs";
 import path from "node:path";
 
 const DEFAULT_ROOT = "/home/nahida/agents/sever/dsh/.dsh-codex/sessions";
+const PRIME_BYTES = 64 * 1024;
 
+/**
+ * Follow complete records by byte offset. Filesystem notifications provide
+ * low-latency delivery; a slow rescan covers lost notifications and new roots.
+ * @param pushFrame Receives ordinary DSH session/event frames.
+ * @param signal Optional owner lifetime.
+ * @param options Root and timing overrides for isolated tests/deployments.
+ * @returns Idempotent disposer for the watcher and both timers.
+ */
 export function startCodexTailer(pushFrame, signal, options = {}) {
+  if (signal?.aborted) return () => {};
   const root = options.root || process.env.DSH_CODEX_SESSIONS_ROOT || DEFAULT_ROOT;
-  const intervalMs = options.intervalMs || 250;
   const cursors = new Map();
-
-  const scan = (push) => {
-    let workspaces;
-    try {
-      workspaces = fs.readdirSync(root, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const workspace of workspaces) {
-      if (!workspace.isDirectory()) continue;
-      const workspaceDir = path.join(root, workspace.name);
-      let sessions;
-      try {
-        sessions = fs.readdirSync(workspaceDir, { withFileTypes: true });
-      } catch {
-        continue;
-      }
-      for (const session of sessions) {
-        if (!session.isDirectory() || !session.name.startsWith("session-")) continue;
-        const file = path.join(workspaceDir, session.name, "session.jsonl");
-        let stat;
-        try {
-          stat = fs.statSync(file);
-        } catch {
-          continue;
-        }
-        const key = session.name;
-        let cursor = cursors.get(key);
-        if (cursor === undefined) {
-          // Prime from the whole file so the first live push carries only new
-          // work, then follow from the end.
-          const primed = prime(file, stat.size);
-          cursors.set(key, primed);
-          continue;
-        }
-        if (stat.size === cursor.offset) continue;
-        if (stat.size < cursor.offset) {
-          // The projector rewrote this log from scratch; re-prime.
-          cursors.set(key, prime(file, stat.size));
-          continue;
-        }
-        const chunk = readRange(file, cursor.offset, stat.size - cursor.offset);
-        if (chunk === null) continue;
-        const { events, offset } = parseLines(chunk, cursor.offset);
-        cursor.offset = offset;
-        if (push) {
-          for (const event of events) {
-            if (typeof event.seq !== "number") continue;
-            if (event.seq <= cursor.lastSeq) continue;
-            cursor.lastSeq = event.seq;
-            pushFrame({ type: "session/event", sessionId: key, event });
-          }
-        } else {
-          for (const event of events) {
-            if (typeof event.seq === "number" && event.seq > cursor.lastSeq) cursor.lastSeq = event.seq;
-          }
-        }
-      }
-    }
-  };
-
-  const prime = (file, size) => {
-    const cursor = { offset: 0, lastSeq: -1 };
-    if (size === 0) return cursor;
-    const chunk = readRange(file, 0, size);
-    if (chunk === null) return cursor;
-    const { events, offset } = parseLines(chunk, 0);
-    cursor.offset = offset;
-    for (const event of events) {
-      if (typeof event.seq === "number" && event.seq > cursor.lastSeq) cursor.lastSeq = event.seq;
-    }
-    return cursor;
-  };
+  const dirty = new Set();
+  let stopped = false;
+  let flushTimer;
+  let watcher;
 
   const readRange = (file, offset, length) => {
     let fd;
     try {
       fd = fs.openSync(file, "r");
       const buffer = Buffer.allocUnsafe(length);
-      const read = fs.readSync(fd, buffer, 0, length, offset);
-      return buffer.subarray(0, read);
+      return buffer.subarray(0, fs.readSync(fd, buffer, 0, length, offset));
     } catch {
       return null;
     } finally {
-      if (fd !== undefined) {
-        try {
-          fs.closeSync(fd);
-        } catch {
-          /* the handle is already gone; nothing left to release */
-        }
-      }
+      if (fd !== undefined) fs.closeSync(fd);
     }
   };
 
-  // File offsets are bytes, not JavaScript string positions: UTF-8 characters
-  // can occupy several bytes, especially in Chinese conversations.
   const parseLines = (bytes, offset) => {
     const events = [];
     let start = 0;
-    let consumed = offset;
-    let index = bytes.indexOf(10);
-    while (index !== -1) {
-      const line = bytes.subarray(start, index).toString("utf-8").trim();
-      consumed += index + 1 - start;
-      start = index + 1;
-      if (line) {
-        try {
-          events.push(JSON.parse(line));
-        } catch {
-          // A complete but malformed record cannot be delivered as an event.
-        }
-      }
-      index = bytes.indexOf(10, start);
+    let end;
+    while ((end = bytes.indexOf(10, start)) !== -1) {
+      const line = bytes.subarray(start, end).toString("utf-8").trim();
+      start = end + 1;
+      if (!line) continue;
+      try { events.push(JSON.parse(line)); }
+      catch { /* Ignore malformed complete records, retain incomplete tails. */ }
     }
-    // The offset stops at the last complete line, so a half-written line is
-    // re-read (and completed) by the next scan instead of being lost.
-    return { events, offset: consumed };
+    return { events, offset: offset + start };
+  };
+
+  const prime = (file, stat) => {
+    const cursor = { offset: 0, lastSeq: -1, ino: stat.ino, dev: stat.dev, mtime: stat.mtimeMs };
+    // Only the final sequence is needed. Opening a browser must not parse
+    // hundreds of megabytes of already-loaded history a second time.
+    let start = Math.max(0, stat.size - PRIME_BYTES);
+    let bytes = readRange(file, start, stat.size - start);
+    if (bytes === null) return cursor;
+    if (start > 0) {
+      const boundary = bytes.indexOf(10);
+      if (boundary < 0) return cursor;
+      start += boundary + 1;
+      bytes = bytes.subarray(boundary + 1);
+    }
+    const parsed = parseLines(bytes, start);
+    cursor.offset = parsed.offset;
+    for (const event of parsed.events) {
+      if (typeof event.seq === "number") cursor.lastSeq = Math.max(cursor.lastSeq, event.seq);
+    }
+    return cursor;
+  };
+
+  const visit = (file, push) => {
+    const key = path.basename(path.dirname(file));
+    if (!key.startsWith("session-")) return;
+    let stat;
+    try { stat = fs.statSync(file); }
+    catch { cursors.delete(file); return; }
+    let cursor = cursors.get(file);
+    if ((!cursor && !push) || (cursor && (
+      stat.ino !== cursor.ino || stat.dev !== cursor.dev || stat.size < cursor.offset
+      || (stat.size === cursor.offset && stat.mtimeMs !== cursor.mtime)))) {
+      cursors.set(file, prime(file, stat));
+      return;
+    }
+    if (!cursor) {
+      // A newly projected session needs its opening events, unlike the initial
+      // server scan, whose existing history is already delivered by history().
+      cursor = { offset: 0, lastSeq: -1, ino: stat.ino, dev: stat.dev, mtime: stat.mtimeMs };
+      cursors.set(file, cursor);
+    }
+    if (stat.size === cursor.offset) return;
+    const bytes = readRange(file, cursor.offset, stat.size - cursor.offset);
+    if (bytes === null) return;
+    const { events, offset } = parseLines(bytes, cursor.offset);
+    cursor.offset = offset;
+    cursor.mtime = stat.mtimeMs;
+    for (const event of events) {
+      if (typeof event.seq !== "number" || event.seq <= cursor.lastSeq) continue;
+      cursor.lastSeq = event.seq;
+      if (push && !stopped) pushFrame({ type: "session/event", sessionId: key, event });
+    }
+  };
+
+  const scan = (push) => {
+    let workspaces;
+    try { workspaces = fs.readdirSync(root, { withFileTypes: true }); }
+    catch { return; }
+    const found = new Set();
+    for (const workspace of workspaces) {
+      if (!workspace.isDirectory()) continue;
+      const directory = path.join(root, workspace.name);
+      let sessions;
+      try { sessions = fs.readdirSync(directory, { withFileTypes: true }); }
+      catch { continue; }
+      for (const session of sessions) {
+        if (!session.isDirectory() || !session.name.startsWith("session-")) continue;
+        const file = path.join(directory, session.name, "session.jsonl");
+        found.add(file);
+        visit(file, push);
+      }
+    }
+    for (const file of cursors.keys()) if (!found.has(file)) cursors.delete(file);
+  };
+
+  const schedule = (relative) => {
+    if (stopped) return;
+    if (relative && path.basename(relative.toString()) === "session.jsonl") {
+      dirty.add(path.join(root, relative.toString()));
+    }
+    if (!dirty.size || flushTimer) return;
+    flushTimer = setTimeout(() => {
+      flushTimer = undefined;
+      const files = [...dirty];
+      dirty.clear();
+      for (const file of files) {
+        try { visit(file, true); }
+        catch { /* A transient read failure is retried by the fallback scan. */ }
+      }
+    }, options.flushMs ?? 25);
+    flushTimer.unref?.();
   };
 
   scan(false);
+  try {
+    watcher = fs.watch(root, { recursive: true, persistent: false }, (_event, relative) => schedule(relative));
+    watcher.on("error", () => { watcher?.close(); watcher = undefined; });
+  } catch { /* Missing root or unsupported watcher: the rescan still follows it. */ }
   const timer = setInterval(() => {
-    try {
-      scan(true);
-    } catch {
-      // A transient read failure must never take down the mux stream.
-    }
-  }, intervalMs);
-  if (timer.unref) timer.unref();
+    try { scan(true); }
+    catch { /* A transient filesystem error cannot take down the mux. */ }
+  }, options.intervalMs ?? 1000);
+  timer.unref?.();
 
-  const stop = () => clearInterval(timer);
+  const stop = () => {
+    if (stopped) return;
+    stopped = true;
+    watcher?.close();
+    clearInterval(timer);
+    clearTimeout(flushTimer);
+    dirty.clear();
+    cursors.clear();
+    signal?.removeEventListener("abort", stop);
+  };
   signal?.addEventListener("abort", stop, { once: true });
   return stop;
 }

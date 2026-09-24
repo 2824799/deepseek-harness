@@ -40,7 +40,7 @@ PERMISSION_FILE = os.path.join(BASE_DIR, "permission-preset.json")
 # session from an older version is rebuilt from its rollout instead of being
 # skipped, because its log is missing whatever the newer rendering adds (for
 # example attached images, or reasoning text that used to be dropped).
-PROJECTION_VERSION = 8
+PROJECTION_VERSION = 9
 
 # Codex item types that each represent one model-visible action, and so each
 # become their own tool row. Projecting only the shell and search calls spliced
@@ -137,6 +137,8 @@ def _completed_item(record):
         "Reasoning": "reasoning", "CommandExecution": "commandExecution",
         "FileChange": "fileChange", "McpToolCall": "mcpToolCall",
         "ContextCompaction": "contextCompaction",
+        "DynamicToolCall": "dynamicToolCall", "WebSearch": "webSearch",
+        "CollabAgentToolCall": "collabAgentToolCall", "ImageView": "imageView",
     }
     if kind not in mapping:
         return None
@@ -180,6 +182,26 @@ def _completed_item(record):
 
 _ROLLOUT_META_CACHE = OrderedDict()
 _ROLLOUT_META_CACHE_LIMIT = 16
+
+_HISTORY_SUMMARY_CACHE = {}
+
+
+def history_summary(connection):
+    """Reuse the history index while both SQLite and its WAL are unchanged."""
+    stamp = []
+    for path in (CODEX_HISTORY, CODEX_HISTORY + "-wal"):
+        try:
+            info = os.stat(path)
+            stamp.append((info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns))
+        except FileNotFoundError:
+            stamp.append(None)
+    key = (CODEX_HISTORY, tuple(stamp))
+    if _HISTORY_SUMMARY_CACHE.get("key") != key:
+        rows = connection.execute(
+            "SELECT thread_id, MAX(rollout_ordinal), COUNT(*), MIN(created_at_ms) "
+            "FROM thread_items GROUP BY thread_id").fetchall()
+        _HISTORY_SUMMARY_CACHE.update(key=key, rows=rows)
+    return _HISTORY_SUMMARY_CACHE["rows"]
 
 
 def _rollout_meta_file(candidate, after_ordinal, incremental):
@@ -674,6 +696,71 @@ def streamed_step(path, turn):
     return state.get("step")
 
 
+def append_live_chunks(request):
+    """Place Codex deltas in their item's step, after its durable predecessor.
+
+    Called only by the projection writer. An item cannot borrow a previous
+    item's step, and a late delta cannot reopen an already completed item.
+    """
+    session_id = request.get("sessionId")
+    item_id = request.get("itemId")
+    source_turn = request.get("turnId")
+    chunks = request.get("chunks")
+    if (not isinstance(session_id, str) or not session_id.startswith("session-")
+            or not isinstance(item_id, str) or not item_id
+            or not isinstance(source_turn, str) or not source_turn
+            or not isinstance(chunks, list) or not chunks or len(chunks) > 5000
+            or any(not isinstance(chunk, dict) for chunk in chunks)):
+        return None
+    path = codex_stream.find_session_file(session_id)
+    if path is None:
+        return None
+    with open(os.path.join(BASE_DIR, "projection.lock"), "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            with open(STATE_FILE, encoding="utf-8") as handle:
+                states = json.load(handle)
+        except (OSError, ValueError):
+            return None
+        cx = states.get(session_id)
+        if not cx or cx.get("version") != PROJECTION_VERSION:
+            return None
+        completed = cx.get("completed_item_ids") or []
+        if item_id in completed:
+            return {"dropped": True}
+        if cx.get("source_turn_id") != source_turn:
+            return None
+        active = cx.get("live_item_id")
+        if active and active != item_id:
+            return None
+        predecessor = request.get("afterItemId")
+        if (not active and predecessor and predecessor != cx.get("last_item_id")
+                and predecessor not in completed):
+            return None
+        out = []
+        now = int(time.time() * 1000)
+        starting = active != item_id
+        if starting:
+            if not cx["step_open"]:
+                cx["step"] += 1
+                cx["step_open"] = True
+                cx["step_start"] = now
+                emit(cx, out, {"type": "step/start", "time": now,
+                               "data": {"turn": cx["turn"], "step": cx["step"]}})
+            cx["live_item_id"] = item_id
+        for chunk in chunks:
+            emit(cx, out, {"type": "assistant/chunk", "time": now,
+                           "data": {"turn": cx["turn"], "step": cx["step"],
+                                    "chunk": chunk}})
+        append_locked(path, out)
+        if starting:
+            # Subsequent deltas need no checkpoint rewrite. The next sweep
+            # reads their time/seq high-water mark from the log's small tail.
+            cx["seq"] = out[-1]["seq"]
+            write_json_if_changed(STATE_FILE, states)
+        return {"seq": out[-1]["seq"], "turn": cx["turn"], "step": cx["step"]}
+
+
 def run():
     os.makedirs(SESSIONS_ROOT, exist_ok=True)
     os.makedirs(STORAGES_ROOT, exist_ok=True)
@@ -694,7 +781,7 @@ def run():
 
     permission_presets = load_permission_presets()
 
-    state_conn = sqlite3.connect(CODEX_STATE)
+    state_conn = sqlite3.connect(f"file:{CODEX_STATE}?mode=ro", uri=True)
     state_cur = state_conn.cursor()
     state_cur.execute("SELECT id, name FROM projects")
     db_projects = dict(state_cur.fetchall())
@@ -727,14 +814,15 @@ def run():
         codex_pending.materialize(thread_id, entry)
     state_conn.close()
 
-    hist_conn = sqlite3.connect(CODEX_HISTORY)
+    hist_conn = sqlite3.connect(f"file:{CODEX_HISTORY}?mode=ro", uri=True)
     hist_cur = hist_conn.cursor()
     rollout_index = build_rollout_index()
     # Cheap change detection: a thread whose newest item and item count are
     # unchanged since the last pass cannot produce new events, so it is skipped
     # entirely. Without this every pass re-read the whole history.
-    hist_cur.execute("SELECT thread_id, MAX(rollout_ordinal), COUNT(*) FROM thread_items GROUP BY thread_id")
-    item_marks = {row[0]: (row[1], row[2]) for row in hist_cur.fetchall()}
+    summary_rows = history_summary(hist_conn)
+    item_marks = {row[0]: (row[1], row[2]) for row in summary_rows}
+    earliest_items = {row[0]: row[3] for row in summary_rows}
 
     # The app-server's project/list owns both the project list and its order.
     # Project membership comes from threads.project_id when assigned, with cwd
@@ -815,8 +903,7 @@ def run():
             # turns. Seeding the session clock from that newer date clamps all
             # earlier events forward and turns minutes into days of fake LLM
             # time. The first durable item is the session's real lower bound.
-            hist_cur.execute("SELECT MIN(created_at_ms) FROM thread_items WHERE thread_id = ?", (th_id,))
-            earliest = hist_cur.fetchone()[0]
+            earliest = earliest_items.get(th_id)
             if isinstance(earliest, int) and earliest > 0:
                 c_ms = min(c_ms, earliest)
             st = states.get(sess_dir_name)
@@ -848,14 +935,17 @@ def run():
                 }
                 continue
 
+            continuing = (st is not None and os.path.exists(jsonl_file)
+                          and st.get("version") == PROJECTION_VERSION)
+            after_ordinal = st.get("last_ordinal", -1) if continuing else -1
             hist_cur.execute("""
                 SELECT item_id, item_type, rollout_ordinal, created_at_ms, item_json, turn_id
                 FROM thread_items
-                WHERE thread_id = ?
+                WHERE thread_id = ? AND rollout_ordinal > ?
                 ORDER BY rollout_ordinal ASC
-            """, (th_id,))
+            """, (th_id, after_ordinal))
             items = hist_cur.fetchall()
-            history_max = max((it[2] for it in items if isinstance(it[2], int)), default=-1)
+            history_max = mark[0] if mark and isinstance(mark[0], int) else -1
             recovery_floor = history_max
             if (st is not None and os.path.exists(jsonl_file)
                     and st.get("version") == PROJECTION_VERSION):
@@ -909,6 +999,7 @@ def run():
             fresh = (st is None or not os.path.exists(jsonl_file)
                      or st.get("version") != PROJECTION_VERSION)
             if fresh:
+                codex_stream._TAIL_CACHE.pop(os.path.abspath(jsonl_file), None)
                 cx = {
                     "seq": -1, "turn": 0, "step": 0, "step_open": False,
                     "turn_open": False, "pending": [], "step_start": None,
@@ -1010,6 +1101,9 @@ def run():
                                          "source": dict(MODEL_SOURCE)}},
                     "surfaceOp": "append",
                 })
+                # DSH has one settled assistant row per step. Keep this item
+                # in its own step so the next tool/answer cannot replace it.
+                close_step(when)
 
             if cx["pending"]:
                 # Publish reasoning held by an earlier pass before any later
@@ -1027,6 +1121,11 @@ def run():
                 except Exception:
                     continue
                 cx["last_ordinal"] = ord_val
+                cx["source_turn_id"] = item_turn_id
+                cx["last_item_id"] = item_id
+                cx["completed_item_ids"] = [*(cx.get("completed_item_ids") or []), item_id][-32:]
+                if cx.get("live_item_id") == item_id:
+                    cx.pop("live_item_id", None)
 
                 # Only the turn's final assistant message carries the total, so
                 # the per-step fold sums each turn exactly once.
@@ -1228,15 +1327,25 @@ def run():
     # exist. The ungrouped bucket uses the fallback root, even when Codex's cwd
     # is elsewhere. Retain displaced copies outside the scanned sessions tree.
     displaced_root = os.path.join(BASE_DIR, "displaced-projections")
-    slugs = [slug for slug in os.listdir(SESSIONS_ROOT)
-             if os.path.isdir(os.path.join(SESSIONS_ROOT, slug))]
+    # Index actual directories once. Testing every thread under every workspace
+    # made an unchanged sweep issue thousands of unnecessary stat calls.
+    locations = {}
+    for workspace_entry in os.scandir(SESSIONS_ROOT):
+        if not workspace_entry.is_dir():
+            continue
+        for session_entry in os.scandir(workspace_entry.path):
+            if session_entry.name.startswith("session-") and session_entry.is_dir():
+                locations.setdefault(session_entry.name, []).append(workspace_entry.name)
     for thread_id, thread_cwd in known_threads.items():
         owner_cwd = thread_cwd if thread_cwd in group_roots else "/home/nahida/agents/sever"
         expected_slug = "--" + owner_cwd.strip("/").replace("/", "-") + "--"
         session_name = "session-" + thread_id
         canonical = os.path.join(SESSIONS_ROOT, expected_slug, session_name, "session.jsonl")
-        candidates = [slug for slug in slugs
-                      if os.path.isfile(os.path.join(SESSIONS_ROOT, slug, session_name, "session.jsonl"))]
+        candidates = locations.get(session_name, [])
+        if len(candidates) < 2:
+            continue
+        candidates = [slug for slug in candidates if os.path.isfile(
+            os.path.join(SESSIONS_ROOT, slug, session_name, "session.jsonl"))]
         if len(candidates) < 2:
             continue
         keeper = expected_slug if os.path.isfile(canonical) else max(

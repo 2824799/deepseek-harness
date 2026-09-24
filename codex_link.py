@@ -22,6 +22,7 @@ import json
 import os
 import sqlite3
 import socket
+from collections import deque
 import struct
 import sys
 import time
@@ -229,9 +230,10 @@ class WSClient:
             resp += chunk
         if b" 101 " not in resp.split(b"\r\n")[0]:
             raise WSError(f"handshake rejected: {resp.split(b'\r\n')[0]!r}")
-        self.buf = b""
+        self.buf = resp.split(b"\r\n\r\n", 1)[1]
         self._next_id = 1
         self._pending = {}
+        self._notifications = deque()
 
     def send_text(self, text):
         data = text.encode()
@@ -300,11 +302,19 @@ class WSClient:
             except ValueError:
                 continue
             if m.get("id") != rid:
+                if isinstance(m.get("method"), str):
+                    self._notifications.append(m)
                 continue
             if "error" in m:
                 return {"ok": False, "error": m["error"]}
             return {"ok": True, "value": m.get("result")}
         return {"ok": False, "error": {"code": -32000, "message": f"{method} timed out"}}
+
+    def recv_notification(self, timeout=0.5):
+        """Drain notifications received before the turn/start reply first."""
+        if self._notifications:
+            return self._notifications.popleft()
+        return json.loads(self.recv_text(timeout=timeout))
 
     def notify(self, method, params=None):
         msg = {"method": method}
