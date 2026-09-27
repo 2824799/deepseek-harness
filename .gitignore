@@ -57,3 +57,5 @@ worktrees/
 native/system/test/bin/
 # Codex web edition runtime state (isolated from upstream)
 .dsh-codex/
+.codex-dsh-runtime/
+.codex-dsh-runtime.stage.*/

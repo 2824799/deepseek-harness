@@ -1,7 +1,7 @@
 // An enclosing `[data-conversation-scroll]` owns scrolling when present;
 // otherwise this view owns it. Each row subscribes to one stable node key.
 
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ComponentProps } from 'react'
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type ComponentProps } from 'react'
 import type {
   ConversationTimelineSnapshot, RenderMessageImages,
 } from '@deepseek-ai/dsh-client-ui-conversation/client'
@@ -9,9 +9,11 @@ import type { SessionSeq } from '@deepseek-ai/dsh-session/types'
 import type { InboxState } from '@deepseek-ai/dsh-agent/types'
 import { Button, IconChevronDownOutline14, MarkdownDelegateProvider, Modal } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { ChatViewSlotProps, OpenFileOptions } from '../contract/slots.ts'
-import type { ChatSnapshot } from '../contract/snapshot.ts'
+import type { ChatNodeStore, ChatSnapshot } from '../contract/snapshot.ts'
+import type { ChatNode } from '../contract/chat-nodes.ts'
 import { PendingSteeringBubble, PendingSubmissionBubble } from './MessageItem.tsx'
 import { ChatNodeSeat } from './ChatNodeSeat.tsx'
+import { reasoningGroups, reasoningOnlyText } from './reasoning-groups.ts'
 import { TurnNavigator } from './TurnNavigator.tsx'
 import { mergeTurnRailItems, type TurnRailItem } from './turn-rail-items.ts'
 import { formatRunDuration } from './message-chrome.ts'
@@ -203,12 +205,63 @@ function TurnStatus({ startTime, t }: {
 
 type ChatNodeListProps = Omit<ComponentProps<typeof ChatNodeSeat>, 'nodeKey'> & {
   readonly order: readonly string[]
+  readonly nodes: ChatNodeStore
 }
 
-const ChatNodeList = memo(function ChatNodeList({ order, ...seatProps }: ChatNodeListProps) {
-  return order.map(nodeKey => (
-    <ChatNodeSeat key={nodeKey} nodeKey={nodeKey} {...seatProps} />
-  ))
+function ReasoningCandidateSeat({ nodeKey, nodes, members, continuation, ...seatProps }: {
+  readonly nodeKey: string
+  readonly nodes: ChatNodeStore
+  readonly members?: readonly string[] | undefined
+  readonly continuation: boolean
+} & Omit<ComponentProps<typeof ChatNodeSeat>, 'nodeKey' | 'mergedReasoningText' | 'mergedReasoningRunning' | 'suppressReasoning'>) {
+  const cached = useRef<{ text: string; running: boolean } | undefined>(undefined)
+  const subscribe = useCallback((listener: () => void) => {
+    if (members === undefined) return () => {}
+    const disposers = members.map(key => nodes.source(key).subscribe(listener))
+    return () => { for (const dispose of disposers) dispose() }
+  }, [members, nodes])
+  const getSnapshot = useCallback((): { text: string; running: boolean } | undefined => {
+    if (members === undefined) return undefined
+    const sections: string[] = []
+    let last: ChatNode | undefined
+    for (const key of members) {
+      const node = nodes.get(key) as ChatNode | undefined
+      const text = reasoningOnlyText(node)
+      if (text === undefined) break
+      sections.push(text)
+      last = node
+    }
+    if (sections.length === 0) return undefined
+    const text = sections.join('\n\n')
+    const running = last?.kind === 'assistant-step' && last.data.status === 'running'
+    if (cached.current?.text === text && cached.current.running === running) return cached.current
+    cached.current = { text, running }
+    return cached.current
+  }, [members, nodes])
+  const merged = useSyncExternalStore(subscribe, getSnapshot, getSnapshot)
+  return <ChatNodeSeat nodeKey={nodeKey} mergedReasoningText={merged?.text}
+    mergedReasoningRunning={merged?.running} suppressReasoning={continuation} {...seatProps} />
+}
+
+const ChatNodeList = memo(function ChatNodeList({ order, nodes, ...seatProps }: ChatNodeListProps) {
+  // New steps change order. A grouped step changing from reasoning to prose
+  // changes eligibility; text deltas leave this signature unchanged.
+  const candidates = useMemo(() => reasoningGroups(order, nodes), [order, nodes])
+  const trackedKeys = useMemo(() => [...candidates.leads.values()].flat(), [candidates])
+  const subscribe = useCallback((listener: () => void) => {
+    const disposers = trackedKeys.map(key => nodes.source(key).subscribe(listener))
+    return () => { for (const dispose of disposers) dispose() }
+  }, [nodes, trackedKeys])
+  const getSnapshot = useCallback(() => trackedKeys.map(key => (
+    reasoningOnlyText(nodes.get(key) as ChatNode | undefined) === undefined ? '0' : '1'
+  )).join(''), [nodes, trackedKeys])
+  const eligibility = useSyncExternalStore(subscribe, getSnapshot, getSnapshot)
+  const groups = useMemo(() => reasoningGroups(order, nodes), [order, nodes, eligibility])
+  return order.map(nodeKey => nodes.get(nodeKey)?.kind === 'assistant-step'
+    ? <ReasoningCandidateSeat key={nodeKey} nodeKey={nodeKey} nodes={nodes}
+      members={groups.leads.get(nodeKey)} continuation={groups.continuations.has(nodeKey)}
+      {...seatProps} />
+    : <ChatNodeSeat key={nodeKey} nodeKey={nodeKey} {...seatProps} />)
 })
 
 /**
@@ -785,6 +838,7 @@ export function ChatView({
           <MarkdownDelegateProvider openExternalLink={openExternalLink} openFile={requestOpenFile}>
             <ChatNodeList
               order={order}
+              nodes={nodeStore}
               useChatNode={useChatNode}
               useChatNodeProcess={useChatNodeProcess}
               historyIncomplete={hasMore}

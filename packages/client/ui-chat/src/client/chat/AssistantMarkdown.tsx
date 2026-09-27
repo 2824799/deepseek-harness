@@ -42,7 +42,7 @@ export interface AssistantMarkdownProps {
   t: ChatViewSlotProps['t']
 }
 
-/** Reasoning block as the Think variant summary row (figma 39:28304). */
+/** Adjacent reasoning blocks share one Think row; other blocks break it. */
 export const AssistantMarkdown = memo(function AssistantMarkdown({
   blocks, streaming, interrupted, renderMessageImages,
   reasoningHidden = false, revealProcess, mentions, t,
@@ -82,17 +82,23 @@ export const AssistantMarkdown = memo(function AssistantMarkdown({
           />,
         )
         break
-      case 'reasoning':
+      case 'reasoning': {
+        const start = i
+        const sections = [block.text]
+        while (i + 1 < blocks.length && blocks[i + 1]?.kind === 'reasoning') {
+          sections.push((blocks[++i] as typeof block).text)
+        }
         rendered.push(
           <ProcessReasoning
-            key={i}
+            key={start}
             hidden={reasoningHidden}
             reveal={revealProcess}
           >
-            <ReasoningRow text={block.text} running={streaming && i === last} t={t} />
+            <ReasoningRow text={sections.join('\n\n')} running={streaming && i === last} t={t} />
           </ProcessReasoning>,
         )
         break
+      }
       case 'image': {
         // Consecutive image blocks share one gallery so several images tile
         // into rows instead of each opening a one-image group of its own.

@@ -10,8 +10,12 @@
  * Run with: node patch_apiproxy.js
  */
 import fs from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
-const PKG = '/home/nahida/.local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-host-apiproxy/lib/index.js';
+const RUNTIME = process.env.DSH_CODEX_RUNTIME_ROOT ?? fileURLToPath(new URL('./.codex-dsh-runtime/', import.meta.url));
+const installed = (path) => join(RUNTIME, 'node_modules', '@deepseek-ai', path);
+const PKG = installed('dsh-host-apiproxy/lib/index.js');
 const BRIDGE = '/home/nahida/agents/sever/dsh/bridge_hook.js';
 const TAILER = '/home/nahida/agents/sever/dsh/codex_tailer.js';
 const GUARD = 'process.env.DSH_HOME && process.env.DSH_HOME.includes(".dsh-codex")';
@@ -270,7 +274,7 @@ ensure('codexModelCatalog(catalog.groups)', () => code.replace(
 // session's agent before running it — which resumes the session and appends a
 // second writer's events to the projected log. Codex owns the sandbox and
 // approval pair, so the command is answered at the gateway instead.
-const GATEWAY = '/home/nahida/.local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-api-gateway/lib/index.js';
+const GATEWAY = installed('dsh-api-gateway/lib/index.js');
 {
   let gcode = fs.readFileSync(GATEWAY, 'utf-8');
   if (!gcode.includes('handleCodexPermission')) {
@@ -438,7 +442,7 @@ ensure('codexWorkspaceOrderFrame', () => code.replace(
 
 // --- 14. client accepts the extra session.list columns ------------------
 {
-  const CC = '/home/nahida/.local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-client-connection/lib/client.js';
+  const CC = installed('dsh-client-connection/lib/client.js');
   let ccode = fs.readFileSync(CC, 'utf-8');
   const NEEDLE = 'agentPreset: string().optional(),\n\t\t\tprojections: lazy(() => sessionProjectionsBlockSchema).optional()';
   if (!ccode.includes('title: string().optional(),')) {
@@ -455,7 +459,7 @@ ensure('codexWorkspaceOrderFrame', () => code.replace(
 
 // --- 15. client keeps the session list fresh while the page is open -----
 {
-  const CR = '/home/nahida/.local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-client-runtime/lib/client.js';
+  const CR = installed('dsh-client-runtime/lib/client.js');
   let rcode = fs.readFileSync(CR, 'utf-8');
   if (!rcode.includes('codexListTimer')) {
     const anchor = '\t\t\trefreshList() {\n\t\t\t\tif (this.listInflight !== null) return this.listInflight;\n\t\t\t\tthis.listState = "loading";';
@@ -479,7 +483,7 @@ ensure('codexWorkspaceOrderFrame', () => code.replace(
 // refresh belongs only to the independent 3080 page. This also upgrades an
 // earlier patch that installed the timer without a port guard.
 {
-  const CR = '/home/nahida/.local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-client-runtime/lib/client.js';
+  const CR = installed('dsh-client-runtime/lib/client.js');
   let rcode = fs.readFileSync(CR, 'utf-8');
   const unscoped = 'if (this.codexListTimer === void 0) this.codexListTimer = setInterval(() => {';
   if (rcode.includes(unscoped)) {
@@ -492,7 +496,7 @@ ensure('codexWorkspaceOrderFrame', () => code.replace(
 // A Codex project may be removed and then re-added with its stable id. Clear
 // the client tombstone when the projector sends a fresh workspace frame.
 {
-  const CR = '/home/nahida/.local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-client-runtime/lib/client.js';
+  const CR = installed('dsh-client-runtime/lib/client.js');
   let rcode = fs.readFileSync(CR, 'utf-8');
   const anchor = 'if (envelope.payload.type === "host/workspace-changed") this.upsert(envelope.payload.workspace);';
   if (!rcode.includes('codexReaddedWorkspace')) {

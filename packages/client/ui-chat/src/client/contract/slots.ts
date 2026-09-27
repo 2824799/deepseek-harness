@@ -79,6 +79,10 @@ export interface ChatNodeTurnDataInjected {
 /** Stable owner currency delivered to a keyed Chat renderer. */
 export interface ChatNodeOwnerProps {
   cwd?: string | undefined
+  /** Display-only combined text for adjacent reasoning-only Assistant steps. */
+  mergedReasoningText?: string | undefined
+  /** The last reasoning-only step in the combined display is streaming. */
+  mergedReasoningRunning?: boolean | undefined
   /** Open the current source file of a skill referenced by a sent message. */
   openSkill: (name: string) => void
   openFile: (path: string, options?: OpenFileOptions) => void

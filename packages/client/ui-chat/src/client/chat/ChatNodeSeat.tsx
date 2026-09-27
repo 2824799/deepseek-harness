@@ -5,11 +5,13 @@ import type { ChatNodeOwnerProps, ChatViewSlotProps } from '../contract/slots.ts
 import type { ChatNode } from '../contract/chat-nodes.ts'
 import { TURN_PROCESS_INDEPENDENT_KINDS } from '../contract/turn-process.ts'
 import { storedTurnProcessEntry } from '../stores.ts'
+import { reasoningOnlyText } from './reasoning-groups.ts'
 import { useSearchableHidden } from './searchable-hidden.ts'
 import css from './ChatView.module.css'
 
 interface ChatNodeSeatProps extends ChatNodeOwnerProps {
   readonly nodeKey: string
+  readonly suppressReasoning?: boolean | undefined
   readonly useChatNode: ChatViewSlotProps['useChatNode']
   readonly useChatNodeProcess: ChatViewSlotProps['useChatNodeProcess']
   readonly historyIncomplete: boolean
@@ -37,6 +39,7 @@ function turnOf(node: ChatNode | undefined): number | undefined {
 /** Subscribe, apply Turn-process visibility, and dispatch one stable Context key. */
 export const ChatNodeSeat = memo(function ChatNodeSeat({
   nodeKey, useChatNode, useChatNodeProcess, historyIncomplete, compactTranscript,
+  mergedReasoningText, mergedReasoningRunning, suppressReasoning = false,
   cwd, openFile, openSkill, inspectCall, forkAt,
   loadImage, renderMessageImages, fileMentions, useStore, actions, renderSlot, t,
 }: ChatNodeSeatProps) {
@@ -116,12 +119,13 @@ export const ChatNodeSeat = memo(function ChatNodeSeat({
     node, cwd, openFile, openSkill, inspectCall, forkAt,
     loadImage, renderMessageImages, fileMentions, turnProcess,
   ])
-  if (routedNode === undefined || owner === null) return null
+  if (routedNode === undefined || owner === null
+    || (suppressReasoning && reasoningOnlyText(routedNode) !== undefined)) return null
   const turnData = turnDataOf(routedNode)
   // Runtime dispatch owns the correlation: every Node's discriminant is the
   // keyed-slot entry passed alongside that same Node. TypeScript does not
   // distribute an object containing a union into a union of objects itself.
-  const routedOwner = { ...owner, node: routedNode } as RoutedChatNodeOwner
+  const routedOwner = { ...owner, node: routedNode, mergedReasoningText, mergedReasoningRunning } as RoutedChatNodeOwner
   return (
     <div
       ref={wrapperRef}

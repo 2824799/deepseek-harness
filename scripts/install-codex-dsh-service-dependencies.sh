@@ -7,6 +7,7 @@ unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 
 mkdir -p "$unit_dir/codex-dsh-web.service.d" "$unit_dir/codex-dsh-sync.service.d"
 ln -sfn "$source_dir/systemd/codex-dsh-web.service.d/10-projection.conf" "$unit_dir/codex-dsh-web.service.d/10-projection.conf"
+ln -sfn "$source_dir/systemd/codex-dsh-web.service.d/20-isolated-runtime.conf" "$unit_dir/codex-dsh-web.service.d/20-isolated-runtime.conf"
 ln -sfn "$source_dir/systemd/codex-dsh-sync.service.d/10-web-lifecycle.conf" "$unit_dir/codex-dsh-sync.service.d/10-web-lifecycle.conf"
 
 systemctl --user daemon-reload

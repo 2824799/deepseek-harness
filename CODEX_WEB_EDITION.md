@@ -9,6 +9,7 @@ page is only a view and an input surface for it.
 | Piece | Path | Role |
 | --- | --- | --- |
 | Web UI | `127.0.0.1:3080` | The DSH front end, isolated on its own port |
+| Runtime | `.codex-dsh-runtime/` | Independent copy of the compatible installed DSH package, including the served UI and Codex hooks |
 | State | `.dsh-codex/` | This edition's own DSH home; `~/.dsh` is never touched |
 | App-server | `ws://127.0.0.1:45880` | Codex JSON-RPC channel the bridge talks to |
 | Bridge | `codex_link.py`, `codex_bridge.py` | Executes web actions through Codex |
@@ -109,10 +110,17 @@ Reasoning text is requested with detailed summaries when the model exposes it.
 
 The desktop launcher in the Desktop folder opens Konsole, starts the 3080 web
 service and its required sync daemon, and follows both journals. Closing that
-terminal stops both services. Install the user-service dependencies with
-`scripts/install-codex-dsh-service-dependencies.sh`; the launcher command is
-maintained in scripts/start-codex-dsh-web-terminal.sh. The sync daemon does not
-start by itself on login, so an inactive web UI cannot leave it running.
+terminal stops both services. Prepare the private runtime with
+`scripts/prepare-codex-dsh-runtime.sh`, then install its user-service
+configuration with `scripts/install-codex-dsh-service-dependencies.sh`.
+The 3080 service starts the private runtime's `lib/bin.js`. The ordinary
+`dsh-web.service` keeps using the global installation on port 8080.
+The checkout is a newer DSH release than the compatible private runtime; its
+frontend source is not directly served by the older host. Instead, the
+repeatable Codex UI patch is applied to the private runtime's client bundle.
+The launcher command is maintained in scripts/start-codex-dsh-web-terminal.sh.
+The sync daemon does not start by itself on login, so an inactive web UI cannot
+leave it running.
 
 ```
 systemctl --user status codex-dsh-appserver.service   # Codex app-server (45880)
@@ -123,9 +131,13 @@ systemctl --user status codex-dsh-sync.service        # projection daemon
 ## Reapplying after a DSH upgrade
 
 ```
-node /home/nahida/agents/sever/dsh/patch_apiproxy.js
-node /home/nahida/agents/sever/dsh/patch_workspace_rows.js
+bash /home/nahida/agents/sever/dsh/scripts/prepare-codex-dsh-runtime.sh
+bash /home/nahida/agents/sever/dsh/scripts/install-codex-dsh-service-dependencies.sh
 systemctl --user restart codex-dsh-web.service
 ```
 
-The patcher is idempotent and reports a `MISS` for any hook whose anchor moved.
+The patchers are idempotent and report a `MISS` or an anchor error when
+an installed package update changes their target code. The private runtime is
+copied once; to update its base version, build and validate a new compatible
+copy before replacing it. Do not repoint the 3080 service to the newer source
+CLI without porting the Codex bridge to that version's API.

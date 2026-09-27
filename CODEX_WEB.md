@@ -1,6 +1,6 @@
 # Codex 网页端适配
 
-改版网页运行在 3080 端口，数据存于仓库内的 .dsh-codex 目录。服务名为 codex-dsh-web、codex-dsh-appserver 和 codex-dsh-sync。升级 DSH 后可在此目录运行 node patch_apiproxy.js 重新应用安装包补丁。
+改版网页运行在 3080 端口，数据存于仓库内的 .dsh-codex 目录，运行包位于仓库内的 .codex-dsh-runtime 目录。桌面快捷方式启动 codex-dsh-web.service，该服务从独立运行包加载前端和后端；原版 8080 的 dsh-web.service 仍从系统安装目录加载。服务名为 codex-dsh-web、codex-dsh-appserver 和 codex-dsh-sync。重新部署时运行 bash scripts/prepare-codex-dsh-runtime.sh，随后运行 bash scripts/install-codex-dsh-service-dependencies.sh 并重启 3080 服务。独立运行包基于兼容的已安装 DSH 版本，仓库中的新版前端源码不会被旧版运行包直接加载；Codex 专用页面行为由仓库内的可重放补丁部署到独立运行包。
 
 项目列表来自 Codex app-server 的 project/list；同步进程把线程历史投影到网页数据目录，并按项目根路径归组。已打开页面会接收工作区新增、变更和移除事件，对话列表每两秒刷新一次；项目列表最多缓存三秒。会话运行标记通过 Codex rollout 文件的近期写入和轮次结束事件估算，长时间没有写入的活动轮次可能暂时显示为空闲。
 

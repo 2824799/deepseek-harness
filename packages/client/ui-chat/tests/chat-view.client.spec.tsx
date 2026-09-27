@@ -506,6 +506,52 @@ function installScrollMetrics(element: HTMLElement, initialHeight: number, clien
 
 describe('Chat node rendering', () => {
 
+  it('joins adjacent reasoning steps across live updates, keeping tool and answer order', () => {
+    const first = reasoningAssistant(2, 'First thought', 1, 1)
+    const second = reasoningAssistant(3, 'Second thought', 1, 2)
+    const tool = toolResult(4, 'a')
+    const third = reasoningAssistant(5, 'Third thought', 1, 3)
+    const fourth = reasoningAssistant(6, 'Fourth thought', 1, 4)
+    const h = makeHarness({ nodes: [user(1, 'question'), first, second, tool, third, fourth] })
+    const view = render(<h.ChatView {...h.props} />)
+    expect(view.getAllByText('思考')).toHaveLength(2)
+    expect(renderedFlowKinds(view.container)).toEqual([
+      'user', 'turn-process', 'assistant-step', 'tool-call', 'assistant-step',
+    ])
+    fireEvent.click(view.getAllByText('思考')[0]!)
+    expect(view.getByText('First thought')).toBeTruthy()
+    expect(view.getByText('Second thought')).toBeTruthy()
+
+    const more = reasoningAssistant(7, 'Fifth thought', 1, 5)
+    act(() => { h.set({ nodes: [user(1, 'question'), first, second, tool, third, fourth, more] }) })
+    expect(view.getAllByText('思考')).toHaveLength(2)
+    fireEvent.click(view.getAllByText('思考')[1]!)
+    expect(view.getByText('Fifth thought')).toBeTruthy()
+
+    const answer = assistant(7, 'Final answer', 1, 5)
+    act(() => { h.set({ nodes: [user(1, 'question'), first, second, tool, third, fourth, answer] }) })
+    expect(view.getAllByText('思考')).toHaveLength(2)
+    expect(view.getByText('Final answer')).toBeTruthy()
+    expect(renderedFlowKinds(view.container)).toEqual([
+      'user', 'turn-process', 'assistant-step', 'tool-call', 'assistant-step', 'assistant-step',
+    ])
+  })
+
+  it('reopens grouping when a former reasoning step becomes prose', () => {
+    const first = reasoningAssistant(2, 'First thought', 1, 1)
+    const middle = reasoningAssistant(3, 'Middle thought', 1, 2)
+    const last = reasoningAssistant(4, 'Last thought', 1, 3)
+    const h = makeHarness({ nodes: [user(1, 'question'), first, middle, last] })
+    const view = render(<h.ChatView {...h.props} />)
+    expect(view.getAllByText('思考')).toHaveLength(1)
+
+    act(() => { h.set({ nodes: [user(1, 'question'), first, assistant(3, 'Interim answer', 1, 2), last] }) })
+    expect(view.getAllByText('思考')).toHaveLength(2)
+    expect(view.getByText('Interim answer')).toBeTruthy()
+    fireEvent.click(view.getAllByText('思考')[1]!)
+    expect(view.getByText('Last thought')).toBeTruthy()
+  })
+
   it('opens Markdown references to unmodified files with line navigation', () => {
     const h = makeHarness({
       nodes: [user(1, 'explain'), assistant(2, '[source](src/index.ts#L24-L30)', 1)],

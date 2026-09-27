@@ -14,6 +14,27 @@ const t = makeTranslate(zh, commonZh)
 const renderMessageImages: AssistantMarkdownProps['renderMessageImages'] = () => null
 
 describe('ReasoningRow', () => {
+  it('combines adjacent reasoning blocks while leaving prose between disclosures', () => {
+    const view = render(
+      <AssistantMarkdown
+        t={t}
+        blocks={[
+          { kind: 'reasoning', text: 'First thought' },
+          { kind: 'reasoning', text: 'Second thought' },
+          { kind: 'text', text: 'Interim answer' },
+          { kind: 'reasoning', text: 'Later thought' },
+        ]}
+        streaming={false}
+        renderMessageImages={renderMessageImages}
+      />,
+    )
+    expect(view.getAllByRole('button', { name: /思考/ })).toHaveLength(2)
+    fireEvent.click(view.getAllByText('思考')[0]!)
+    expect(view.getByText('First thought')).toBeTruthy()
+    expect(view.getByText('Second thought')).toBeTruthy()
+    expect(view.getByText('Interim answer')).toBeTruthy()
+  })
+
   it.each([
     { kind: 'text' as const, text: 'Answer' },
     { kind: 'tool-call' as const, callId: 'call-1', name: 'read', argsRaw: '{}' },
